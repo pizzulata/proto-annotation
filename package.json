@@ -1,0 +1,42 @@
+{
+  "name": "proto-annotation",
+  "version": "0.3.1",
+  "description": "Design review tool for prototypes. Annotate UI elements, generate agent prompts, paste into Cursor/Claude Code.",
+  "bin": {
+    "proto-annotation": "bin/cli.mjs"
+  },
+  "type": "module",
+  "files": [
+    "bin",
+    "src"
+  ],
+  "scripts": {
+    "dev": "node bin/cli.mjs",
+    "start": "node bin/cli.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "open": "^10.1.0",
+    "ws": "^8.18.0"
+  },
+  "keywords": [
+    "annotation",
+    "prototype",
+    "design-review",
+    "ai-agent",
+    "cursor",
+    "claude-code",
+    "figma",
+    "ui-review"
+  ],
+  "homepage": "https://github.com/your-username/proto-annotation",
+  "author": "Simone",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/proto-annotation"
+  }
+}

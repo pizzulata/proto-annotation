@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "proto-annotation",
+      "runtimeExecutable": "/usr/local/bin/node",
+      "runtimeArgs": ["bin/cli.mjs"],
+      "port": 4747
+    }
+  ]
+}
