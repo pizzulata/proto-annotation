@@ -207,79 +207,27 @@ export function createServer({ port, targetUrl, demo, collab }) {
     res.type('text/plain').send(prompt);
   });
 
-  // ── API: Enhance annotation with Claude ──
-  app.post('/api/enhance/:id', async (req, res) => {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) return res.status(400).json({ error: 'no_key', message: 'Set ANTHROPIC_API_KEY to use Enhance' });
+  // ── API: Enhance — fake door, logs click to Google Sheet ──
+  const ENHANCE_WEBHOOK = 'https://script.google.com/macros/s/AKfycbyZkRu7S6h-mn8h7-XG2ORGf649bs_XQXmJqNg0KFHd261bqd4NSZ7V6yaEMV911qfU/exec';
 
+  app.post('/api/enhance/:id', async (req, res) => {
     const all = store.getAnnotations({});
     const annotation = all.find(a => a.id === req.params.id);
     if (!annotation) return res.status(404).json({ error: 'Not found' });
 
-    // Build structured metadata for Claude (not the full prompt doc)
-    const meta = [];
-    meta.push(`Element: <${annotation.element || 'unknown'}> ${annotation.selector || ''}`);
-    if (annotation.elementPath) meta.push(`DOM path: ${annotation.elementPath}`);
-    if (annotation.boundingBox) {
-      const b = annotation.boundingBox;
-      meta.push(`Dimensions: ${Math.round(b.width)}×${Math.round(b.height)}px`);
-    }
-    const labels = annotation.labels || [];
-    if (labels.length) meta.push(`Labels: ${labels.join(', ')}`);
-    if (annotation.computedStyles && Object.keys(annotation.computedStyles).length) {
-      const styles = Object.entries(annotation.computedStyles)
-        .map(([k, v]) => `${k}: ${v}`).join('; ');
-      meta.push(`Current styles: ${styles}`);
-    }
-    if (annotation.parentInfo) {
-      const p = annotation.parentInfo;
-      const parentParts = [];
-      if (p.display) parentParts.push(`display: ${p.display}`);
-      if (p.flexDirection) parentParts.push(`flex-direction: ${p.flexDirection}`);
-      if (p.gap) parentParts.push(`gap: ${p.gap}`);
-      if (parentParts.length) meta.push(`Parent layout: ${parentParts.join(', ')}`);
-    }
-    if (annotation.nearbyText) meta.push(`Visible text: "${annotation.nearbyText.slice(0, 80)}"`);
+    // Fire-and-forget: log click to Google Sheet
+    fetch(ENHANCE_WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: targetUrl || 'demo',
+        annotationType: annotation.type || 'feedback',
+        comment: annotation.comment || '',
+        labels: (annotation.labels || []).join(', '),
+      }),
+    }).catch(() => {}); // never block on this
 
-    const userMessage = `Designer's feedback: "${annotation.comment}"\n\n${meta.join('\n')}`;
-
-    const systemPrompt = `You are an expert design-to-code translator. A designer left feedback on a UI element. Transform it into a precise, unambiguous instruction a coding AI (like Cursor or Claude Code) can execute directly — no interpretation needed.
-
-Rules:
-- Be specific: name exact CSS properties and propose exact values (use the current styles as a baseline)
-- If the designer says "bigger" → specify the new size. If "more spacing" → name the property (padding/margin/gap) and the target value. If "wrong color" → suggest a specific hex.
-- Reference current values to make the change unambiguous (e.g. "change font-size from 14px to 18px")
-- Include the element selector so the AI knows exactly what to target
-- 2–4 sentences. Start with an action verb (Change, Increase, Remove, Add, Replace, Set…)
-- Output only the instruction. No preamble, no "Here is…" opener, no sign-off.`;
-
-    try {
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 500,
-          system: systemPrompt,
-          messages: [{ role: 'user', content: userMessage }],
-        }),
-      });
-
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        return res.status(502).json({ error: err.error?.message || 'API error' });
-      }
-
-      const data = await response.json();
-      const enhanced = data.content?.[0]?.text?.trim() || '';
-      res.json({ enhanced });
-    } catch (err) {
-      res.status(502).json({ error: err.message });
-    }
+    res.json({ fakeDoor: true });
   });
 
   // ── WebSocket broadcast ──
@@ -1374,23 +1322,22 @@ function buildReviewUI(targetUrl, port, demo, collab) {
 
       if (!res.ok || data.error) {
         statusEl.textContent = data.message || data.error || 'Error';
+        enhBtn.disabled = false;
         return;
       }
 
-      // Insert enhanced instruction as a paragraph after the heading line,
-      // keeping the original comment in the heading and all metadata bullets intact.
-      const cached = promptCache[id];
-      const enhanced = cached.replace(
-        /(## \\d+\\. [^\\n]*)\\n/,
-        (_, heading) => heading + '\\n\\n' + data.enhanced + '\\n'
-      );
-      promptOverrides[id] = enhanced;
-
-      if (currentOverlayId === id) {
-        document.getElementById('poText').textContent = getDisplayText(id);
-        document.getElementById('poRevert').style.display = 'inline-flex';
-        statusEl.textContent = 'Enhanced \u2713';
-        setTimeout(() => { if (currentOverlayId === id) statusEl.textContent = ''; }, 3000);
+      // Fake door — show thank-you message, don't modify the prompt
+      if (data.fakeDoor) {
+        statusEl.textContent = '';
+        const body = document.getElementById('poBody');
+        const thankYou = document.createElement('div');
+        thankYou.style.cssText = 'padding:24px 20px;text-align:center;line-height:1.6;color:#9da3b3;font-size:13px;';
+        thankYou.innerHTML = '<div style="font-size:28px;margin-bottom:12px">✨</div>'
+          + '<div style="color:#e4e7ef;font-weight:500;margin-bottom:6px">Enhance is on its way</div>'
+          + '<div>Thanks for the nudge \u2014 we\\'re working on it.</div>';
+        body.innerHTML = '';
+        body.appendChild(thankYou);
+        return;
       }
     } catch (e) {
       statusEl.textContent = 'Error: ' + e.message;

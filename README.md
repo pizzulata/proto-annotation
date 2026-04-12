@@ -57,21 +57,7 @@ Each annotation has a **Preview prompt** button that opens the generated prompt.
 
 Enhance uses the element's actual CSS values, dimensions, and layout context to produce instructions a coding AI can execute without guessing.
 
-### Setup
-
-Enhance requires your own Anthropic API key. Get one at [console.anthropic.com](https://console.anthropic.com), then either:
-
-**Option A** — create a `.env` file in the directory where you run the command:
-```
-ANTHROPIC_API_KEY=sk-ant-...
-```
-
-**Option B** — pass it inline:
-```bash
-npx proto-annotation http://localhost:3000 --anthropic-key sk-ant-...
-```
-
-No key? The rest of the tool works fine — the ✨ Enhance button just stays inactive.
+Enhance is built in — no setup, no API key needed.
 
 ## Real-Time Collaboration
 
