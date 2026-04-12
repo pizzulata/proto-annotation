@@ -1,9 +1,11 @@
 ```
-    ____             __           ___                      __        __  _
-   / __ \_________  / /_____     /   |  ____  ____  ____  / /_____ _/ /_(_)___  ____
-  / /_/ / ___/ __ \/ __/ __ \   / /| | / __ \/ __ \/ __ \/ __/ __ `/ __/ / __ \/ __ \
- / ____/ /  / /_/ / /_/ /_/ /  / ___ |/ / / / / / / /_/ / /_/ /_/ / /_/ / /_/ / / / /
-/_/   /_/   \____/\__/\____/  /_/  |_/_/ /_/_/ /_/\____/\__/\__,_/\__/_/\____/_/ /_/
+    ____             __
+   / __ \_________  / /_____
+  / /_/ / ___/ __ \/ __/ __ \
+ / ____/ /  / /_/ / /_/ /_/ /
+/_/   /_/   \____/\__/\____/
+
+  annotation
 ```
 
 Design review tool for coded prototypes. Annotate UI elements, generate AI-ready prompts, paste into Cursor or Claude Code.
@@ -55,21 +57,21 @@ Each annotation has a **Preview prompt** button that opens the generated prompt.
 
 Enhance uses the element's actual CSS values, dimensions, and layout context to produce instructions a coding AI can execute without guessing.
 
-### Setup (optional)
+### Setup
 
-To use Enhance, add your Anthropic API key. Create a `.env` file in your project root:
+Enhance requires your own Anthropic API key. Get one at [console.anthropic.com](https://console.anthropic.com), then either:
 
+**Option A** — create a `.env` file in the directory where you run the command:
 ```
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Or pass it as a flag:
-
+**Option B** — pass it inline:
 ```bash
 npx proto-annotation http://localhost:3000 --anthropic-key sk-ant-...
 ```
 
-Enhance works without a key — the button simply won't be active.
+No key? The rest of the tool works fine — the ✨ Enhance button just stays inactive.
 
 ## Real-Time Collaboration
 
@@ -82,11 +84,13 @@ npx proto-annotation http://localhost:3000 --collab
 The terminal prints a share URL:
 
 ```
-    ____             __           ___                      __        __  _
-   / __ \_________  / /_____     /   |  ____  ____  ____  / /_____ _/ /_(_)___  ____
-  / /_/ / ___/ __ \/ __/ __ \   / /| | / __ \/ __ \/ __ \/ __/ __ `/ __/ / __ \/ __ \
- / ____/ /  / /_/ / /_/ /_/ /  / ___ |/ / / / / / / /_/ / /_/ /_/ / /_/ / /_/ / / / /
-/_/   /_/   \____/\__/\____/  /_/  |_/_/ /_/_/ /_/\____/\__/\__,_/\__/_/\____/_/ /_/
+    ____             __
+   / __ \_________  / /_____
+  / /_/ / ___/ __ \/ __/ __ \
+ / ____/ /  / /_/ / /_/ /_/ /
+/_/   /_/   \____/\__/\____/
+
+  annotation
 
   v0.4.0  ·  collab
 
