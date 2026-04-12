@@ -7,7 +7,11 @@
  / ____/ /  / /_/ / /_/ /_/ /
 /_/   /_/   \____/\__/\____/
 
-  annotation
+   ___                      __        __  _
+  /   |  ____  ____  ____  / /_____ _/ /_(_)___  ____
+ / /| | / __ \/ __ \/ __ \/ __/ __ `/ __/ / __ \/ __ \
+/ ___ |/ / / / / / / /_/ / /_/ /_/ / /_/ / /_/ / / / /
+/_/  |_/_/ /_/_/ /_/\____/\__/\__,_/\__/_/\____/_/ /_/
 ```
 
 Design review tool for coded prototypes. Annotate UI elements, generate AI-ready prompts, paste into Cursor or Claude Code.
@@ -78,7 +82,11 @@ The terminal prints a share URL:
  / ____/ /  / /_/ / /_/ /_/ /
 /_/   /_/   \____/\__/\____/
 
-  annotation
+   ___                      __        __  _
+  /   |  ____  ____  ____  / /_____ _/ /_(_)___  ____
+ / /| | / __ \/ __ \/ __ \/ __/ __ `/ __/ / __ \/ __ \
+/ ___ |/ / / / / / / /_/ / /_/ /_/ / /_/ / /_/ / / / /
+/_/  |_/_/ /_/_/ /_/\____/\__/\__,_/\__/_/\____/_/ /_/
 
   v0.4.0  ·  collab
 
@@ -173,7 +181,6 @@ npx proto-annotation                    # Demo mode (built-in test page)
   --no-open                             # Don't auto-open browser
   --demo                                # Explicitly use demo mode
   --collab                              # Enable collaborative review session
-  --anthropic-key <key>                 # Claude API key for ✨ Enhance
 ```
 
 ## Works With
