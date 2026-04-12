@@ -207,6 +207,81 @@ export function createServer({ port, targetUrl, demo, collab }) {
     res.type('text/plain').send(prompt);
   });
 
+  // ── API: Enhance annotation with Claude ──
+  app.post('/api/enhance/:id', async (req, res) => {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return res.status(400).json({ error: 'no_key', message: 'Set ANTHROPIC_API_KEY to use Enhance' });
+
+    const all = store.getAnnotations({});
+    const annotation = all.find(a => a.id === req.params.id);
+    if (!annotation) return res.status(404).json({ error: 'Not found' });
+
+    // Build structured metadata for Claude (not the full prompt doc)
+    const meta = [];
+    meta.push(`Element: <${annotation.element || 'unknown'}> ${annotation.selector || ''}`);
+    if (annotation.elementPath) meta.push(`DOM path: ${annotation.elementPath}`);
+    if (annotation.boundingBox) {
+      const b = annotation.boundingBox;
+      meta.push(`Dimensions: ${Math.round(b.width)}×${Math.round(b.height)}px`);
+    }
+    const labels = annotation.labels || [];
+    if (labels.length) meta.push(`Labels: ${labels.join(', ')}`);
+    if (annotation.computedStyles && Object.keys(annotation.computedStyles).length) {
+      const styles = Object.entries(annotation.computedStyles)
+        .map(([k, v]) => `${k}: ${v}`).join('; ');
+      meta.push(`Current styles: ${styles}`);
+    }
+    if (annotation.parentInfo) {
+      const p = annotation.parentInfo;
+      const parentParts = [];
+      if (p.display) parentParts.push(`display: ${p.display}`);
+      if (p.flexDirection) parentParts.push(`flex-direction: ${p.flexDirection}`);
+      if (p.gap) parentParts.push(`gap: ${p.gap}`);
+      if (parentParts.length) meta.push(`Parent layout: ${parentParts.join(', ')}`);
+    }
+    if (annotation.nearbyText) meta.push(`Visible text: "${annotation.nearbyText.slice(0, 80)}"`);
+
+    const userMessage = `Designer's feedback: "${annotation.comment}"\n\n${meta.join('\n')}`;
+
+    const systemPrompt = `You are an expert design-to-code translator. A designer left feedback on a UI element. Transform it into a precise, unambiguous instruction a coding AI (like Cursor or Claude Code) can execute directly — no interpretation needed.
+
+Rules:
+- Be specific: name exact CSS properties and propose exact values (use the current styles as a baseline)
+- If the designer says "bigger" → specify the new size. If "more spacing" → name the property (padding/margin/gap) and the target value. If "wrong color" → suggest a specific hex.
+- Reference current values to make the change unambiguous (e.g. "change font-size from 14px to 18px")
+- Include the element selector so the AI knows exactly what to target
+- 2–4 sentences. Start with an action verb (Change, Increase, Remove, Add, Replace, Set…)
+- Output only the instruction. No preamble, no "Here is…" opener, no sign-off.`;
+
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 500,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: userMessage }],
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        return res.status(502).json({ error: err.error?.message || 'API error' });
+      }
+
+      const data = await response.json();
+      const enhanced = data.content?.[0]?.text?.trim() || '';
+      res.json({ enhanced });
+    } catch (err) {
+      res.status(502).json({ error: err.message });
+    }
+  });
+
   // ── WebSocket broadcast ──
   function broadcast(message, excludeWs) {
     const data = JSON.stringify(message);
@@ -608,6 +683,35 @@ function buildReviewUI(targetUrl, port, demo, collab) {
   .collab-dot:first-child { margin-left: 0; }
   .collab-dot .collab-tooltip { position: absolute; bottom: -24px; left: 50%; transform: translateX(-50%); font-size: 9px; background: var(--surface2); padding: 2px 6px; border-radius: 4px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.15s; border: 1px solid var(--border); }
   .collab-dot:hover .collab-tooltip { opacity: 1; }
+
+  /* ── Prompt toggle button on card ── */
+  .a-prompt-toggle { font-size: 10px; color: var(--muted); cursor: pointer; padding: 3px 0; border: none; background: none; font-family: var(--font-mono); transition: color var(--transition); display: block; margin-top: 6px; text-align: left; }
+  .a-prompt-toggle:hover { color: var(--accent); }
+
+  /* ── Prompt overlay (full modal) ── */
+  .prompt-overlay { position: fixed; inset: 0; z-index: 2000; display: flex; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.2s; }
+  .prompt-overlay.open { opacity: 1; pointer-events: all; }
+  .prompt-overlay-bg { position: absolute; inset: 0; background: rgba(0,0,0,0.65); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+  .prompt-overlay-panel { position: relative; width: 600px; max-width: calc(100vw - 32px); max-height: calc(100vh - 64px); background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-xl); display: flex; flex-direction: column; transform: translateY(8px); transition: transform 0.2s; }
+  .prompt-overlay.open .prompt-overlay-panel { transform: translateY(0); }
+  .prompt-overlay-header { padding: 14px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .prompt-overlay-pin { width: 22px; height: 22px; border-radius: 50%; background: var(--pin); color: #000; font-size: 10px; font-weight: 700; font-family: var(--font-mono); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .prompt-overlay-selector { font-family: var(--font-mono); font-size: 10px; color: var(--accent); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .prompt-overlay-close { margin-left: auto; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 20px; padding: 2px 6px; border-radius: 4px; line-height: 1; transition: all var(--transition); flex-shrink: 0; }
+  .prompt-overlay-close:hover { background: var(--surface2); color: var(--text-secondary); }
+  .prompt-overlay-body { flex: 1; overflow-y: auto; padding: 16px; min-height: 180px; }
+  .prompt-overlay-text { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); line-height: 1.75; white-space: pre-wrap; word-break: break-word; }
+  .prompt-overlay-textarea { width: 100%; min-height: 220px; font-family: var(--font-mono); font-size: 11px; color: var(--text); line-height: 1.75; background: var(--bg); border: 1px solid var(--accent); border-radius: 6px; padding: 12px; resize: vertical; outline: none; box-sizing: border-box; }
+  .prompt-overlay-footer { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; gap: 6px; align-items: center; flex-shrink: 0; flex-wrap: wrap; }
+  .po-btn { padding: 5px 11px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface3); color: var(--text-secondary); font-size: 11px; font-family: var(--font-mono); cursor: pointer; transition: all var(--transition); }
+  .po-btn:hover:not(:disabled) { border-color: var(--border-hover); color: var(--text); }
+  .po-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .po-btn.enhance { color: var(--accent); border-color: var(--accent-medium); background: var(--accent-soft); }
+  .po-btn.enhance:hover:not(:disabled) { opacity: 0.85; }
+  .po-btn.copy-p { color: var(--green); border-color: var(--green-soft); background: var(--green-soft); }
+  .po-btn.copy-p:hover:not(:disabled) { opacity: 0.85; }
+  .po-btn.revert-p { color: var(--amber); border-color: var(--amber-soft); background: var(--amber-soft); }
+  .po-status { font-size: 10px; color: var(--muted); font-family: var(--font-mono); margin-left: auto; }
 </style>
 </head>
 <body>
@@ -674,6 +778,28 @@ function buildReviewUI(targetUrl, port, demo, collab) {
   </div>
 </div>
 
+<!-- Prompt overlay -->
+<div class="prompt-overlay" id="promptOverlay">
+  <div class="prompt-overlay-bg" id="promptOverlayBg"></div>
+  <div class="prompt-overlay-panel">
+    <div class="prompt-overlay-header">
+      <div class="prompt-overlay-pin" id="poPin">1</div>
+      <div class="prompt-overlay-selector" id="poSelector"></div>
+      <button class="prompt-overlay-close" id="poClose">&times;</button>
+    </div>
+    <div class="prompt-overlay-body" id="poBody">
+      <div class="prompt-overlay-text" id="poText"></div>
+    </div>
+    <div class="prompt-overlay-footer">
+      <button class="po-btn enhance" id="poEnhance">✨ Enhance</button>
+      <button class="po-btn" id="poEdit">✏️ Edit</button>
+      <button class="po-btn revert-p" id="poRevert" style="display:none">Revert</button>
+      <button class="po-btn copy-p" id="poCopy">Copy</button>
+      <span class="po-status" id="poStatus"></span>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -683,6 +809,10 @@ function buildReviewUI(targetUrl, port, demo, collab) {
   let annotations = [];
   let history = [];
   let activeTab = 'annotations';
+  const promptOverrides = {};
+  const promptCache = {};
+  const pageUrl = '${escHtml(targetUrl || 'prototype')}';
+  let currentOverlayId = null;
 
   let myToken = null;
   let myParticipant = null;
@@ -876,6 +1006,7 @@ function buildReviewUI(targetUrl, port, demo, collab) {
           <input class="a-label-input" id="label-input-\${a.id}" style="display:none" placeholder="label…" maxlength="20">
         </div>
         <div class="a-note">\${esc(a.comment || '')}</div>
+        <button class="a-prompt-toggle" data-action="open-prompt" data-id="\${a.id}">▸ Preview prompt</button>
         <div class="a-meta">
           <span>\${a.element || ''}</span>
           <span style="display:flex;align-items:center;gap:6px;">
@@ -885,6 +1016,7 @@ function buildReviewUI(targetUrl, port, demo, collab) {
         </div>
       </div>
     \`).join('');
+
   }
 
   function focusAnnotation(id) {
@@ -1020,13 +1152,26 @@ function buildReviewUI(targetUrl, port, demo, collab) {
   });
 
   // ═══ COPY ═══
-  function copyPrompt() {
-    fetch('/api/prompt')
-      .then(r => r.text())
-      .then(prompt => {
-        copyToClipboard(prompt);
-        showToast('Copied agent prompt · ' + annotations.length + ' items');
-      });
+  async function copyPrompt() {
+    // Fetch any uncached individual prompts
+    await Promise.all(annotations.map(a => {
+      if (!promptCache[a.id]) {
+        return fetch('/api/prompt/' + a.id).then(r => r.text()).then(t => { promptCache[a.id] = t; });
+      }
+    }));
+
+    const n = annotations.length;
+    const header = '# Design Review \u2014 ' + pageUrl + '\\n\\n'
+      + 'A designer reviewed this prototype and annotated ' + n + ' element' + (n !== 1 ? 's' : '') + '. '
+      + 'For each: find the element in the codebase, make the change, state the file and what you did.\\n\\n';
+
+    const body = annotations.map((a, i) => {
+      const raw = promptOverrides[a.id] !== undefined ? promptOverrides[a.id] : (promptCache[a.id] || '');
+      return extractSection(raw, i + 1);
+    }).join('');
+
+    copyToClipboard(header + body + '---\\n');
+    showToast('Copied \u00b7 ' + n + ' annotation' + (n !== 1 ? 's' : ''));
   }
   function copyAnnotation(id) {
     fetch('/api/prompt/' + id)
@@ -1113,6 +1258,199 @@ function buildReviewUI(targetUrl, port, demo, collab) {
     t.textContent = msg;
     t.classList.add('show');
     setTimeout(() => t.classList.remove('show'), 2200);
+  }
+
+  // ═══ PROMPT OVERLAY ═══
+
+  // Delegation on annotationList (capture) — opens overlay without triggering card onclick
+  document.getElementById('annotationList').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-action="open-prompt"]');
+    if (!btn) return;
+    e.stopPropagation();
+    openPromptOverlay(btn.dataset.id);
+  }, true);
+
+  // Static overlay button listeners
+  document.getElementById('poClose').addEventListener('click', closePromptOverlay);
+  document.getElementById('promptOverlayBg').addEventListener('click', closePromptOverlay);
+  document.getElementById('poEnhance').addEventListener('click', enhanceOverlayPrompt);
+  document.getElementById('poEdit').addEventListener('click', toggleOverlayEdit);
+  document.getElementById('poRevert').addEventListener('click', revertOverlayPrompt);
+  document.getElementById('poCopy').addEventListener('click', copyOverlayPrompt);
+
+  // Close on Escape
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && currentOverlayId) closePromptOverlay();
+  });
+
+  function extractSection(fullText, newIndex) {
+    if (!fullText) return '';
+    const start = fullText.indexOf('---\\n\\n');
+    if (start === -1) return '---\\n\\n' + fullText.trim() + '\\n\\n';
+    let section = fullText.slice(start + 7);
+    if (section.endsWith('---\\n')) section = section.slice(0, -5);
+    section = section.trim();
+    if (newIndex !== undefined) {
+      section = section.replace(/^## \\d+\\./, '## ' + newIndex + '.');
+    }
+    return '---\\n\\n' + section + '\\n\\n';
+  }
+
+  function getDisplayText(id) {
+    const raw = promptOverrides[id] !== undefined ? promptOverrides[id] : (promptCache[id] || '');
+    const start = raw.indexOf('---\\n\\n');
+    if (start === -1) return raw.trim();
+    let section = raw.slice(start + 7);
+    if (section.endsWith('---\\n')) section = section.slice(0, -5);
+    return section.trim();
+  }
+
+  async function openPromptOverlay(id) {
+    currentOverlayId = id;
+    const a = annotations.find(x => x.id === id);
+    const idx = annotations.indexOf(a);
+
+    // Header info
+    document.getElementById('poPin').textContent = idx + 1;
+    document.getElementById('poSelector').textContent = a ? (a.elementPath || a.selector || '') : '';
+
+    // Reset footer state
+    document.getElementById('poStatus').textContent = '';
+    document.getElementById('poRevert').style.display = promptOverrides[id] !== undefined ? 'inline-flex' : 'none';
+    document.getElementById('poEnhance').disabled = false;
+    poSetViewMode();
+
+    // Show overlay
+    document.getElementById('promptOverlay').classList.add('open');
+
+    // Load prompt
+    const textEl = document.getElementById('poText');
+    if (promptCache[id] || promptOverrides[id] !== undefined) {
+      textEl.textContent = getDisplayText(id);
+    } else {
+      textEl.textContent = '\u2026';
+      try {
+        const text = await fetch('/api/prompt/' + id).then(r => r.text());
+        promptCache[id] = text;
+        if (currentOverlayId === id) textEl.textContent = getDisplayText(id);
+      } catch (e) {
+        textEl.textContent = 'Failed to load prompt.';
+      }
+    }
+  }
+
+  function closePromptOverlay() {
+    const ta = document.getElementById('poBody').querySelector('textarea');
+    if (ta && currentOverlayId) {
+      promptOverrides[currentOverlayId] = rebuildWithComment(currentOverlayId, ta.value);
+    }
+    document.getElementById('promptOverlay').classList.remove('open');
+    currentOverlayId = null;
+  }
+
+  function rebuildWithComment(id, newSectionText) {
+    // If we have the original cached full prompt, swap its section with newSectionText
+    const cached = promptCache[id];
+    if (!cached) return newSectionText;
+    const start = cached.indexOf('---\\n\\n');
+    if (start === -1) return newSectionText;
+    const header = cached.slice(0, start);
+    return header + '---\\n\\n' + newSectionText.trim() + '\\n\\n---\\n';
+  }
+
+  async function enhanceOverlayPrompt() {
+    if (!currentOverlayId) return;
+    const id = currentOverlayId;
+    if (!promptCache[id]) return;
+
+    const enhBtn = document.getElementById('poEnhance');
+    const statusEl = document.getElementById('poStatus');
+    enhBtn.disabled = true;
+    statusEl.textContent = '✨ Enhancing\u2026';
+
+    try {
+      const res = await fetch('/api/enhance/' + id, { method: 'POST' });
+      const data = await res.json();
+
+      if (!res.ok || data.error) {
+        statusEl.textContent = data.message || data.error || 'Error';
+        return;
+      }
+
+      // Insert enhanced instruction as a paragraph after the heading line,
+      // keeping the original comment in the heading and all metadata bullets intact.
+      const cached = promptCache[id];
+      const enhanced = cached.replace(
+        /(## \\d+\\. [^\\n]*)\\n/,
+        (_, heading) => heading + '\\n\\n' + data.enhanced + '\\n'
+      );
+      promptOverrides[id] = enhanced;
+
+      if (currentOverlayId === id) {
+        document.getElementById('poText').textContent = getDisplayText(id);
+        document.getElementById('poRevert').style.display = 'inline-flex';
+        statusEl.textContent = 'Enhanced \u2713';
+        setTimeout(() => { if (currentOverlayId === id) statusEl.textContent = ''; }, 3000);
+      }
+    } catch (e) {
+      statusEl.textContent = 'Error: ' + e.message;
+    } finally {
+      enhBtn.disabled = false;
+    }
+  }
+
+  function revertOverlayPrompt() {
+    if (!currentOverlayId) return;
+    delete promptOverrides[currentOverlayId];
+    document.getElementById('poText').textContent = getDisplayText(currentOverlayId);
+    document.getElementById('poRevert').style.display = 'none';
+    document.getElementById('poStatus').textContent = '';
+    poSetViewMode();
+  }
+
+  function toggleOverlayEdit() {
+    const body = document.getElementById('poBody');
+    const ta = body.querySelector('textarea');
+    if (ta) {
+      // Currently editing → Done
+      const newText = ta.value;
+      promptOverrides[currentOverlayId] = rebuildWithComment(currentOverlayId, newText);
+      document.getElementById('poRevert').style.display = 'inline-flex';
+      poSetViewMode();
+      document.getElementById('poText').textContent = getDisplayText(currentOverlayId);
+    } else {
+      // Enter edit mode
+      const current = getDisplayText(currentOverlayId);
+      const textarea = document.createElement('textarea');
+      textarea.className = 'prompt-overlay-textarea';
+      textarea.value = current;
+      body.innerHTML = '';
+      body.appendChild(textarea);
+      textarea.focus();
+      document.getElementById('poEdit').textContent = 'Done';
+      document.getElementById('poEnhance').disabled = true;
+    }
+  }
+
+  function poSetViewMode() {
+    const body = document.getElementById('poBody');
+    if (!body.querySelector('.prompt-overlay-text')) {
+      body.innerHTML = '<div class="prompt-overlay-text" id="poText"></div>';
+    }
+    document.getElementById('poEdit').textContent = '\u270f\ufe0f Edit';
+    document.getElementById('poEnhance').disabled = false;
+  }
+
+  function copyOverlayPrompt() {
+    if (!currentOverlayId) return;
+    // If editing, copy what's in the textarea
+    const ta = document.getElementById('poBody').querySelector('textarea');
+    const text = ta ? ta.value : getDisplayText(currentOverlayId);
+    copyToClipboard(text);
+    const btn = document.getElementById('poCopy');
+    btn.textContent = '\u2713 Copied';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+    showToast('Copied prompt');
   }
 </script>
 </body>
