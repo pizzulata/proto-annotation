@@ -19,11 +19,11 @@ import { createServer as createHttpServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { createStore } from '../lib/store.mjs';
 
-export function createServer({ port, targetUrl, demo, collab }) {
+export function createServer({ port, targetUrl, demo, collab, dataPath }) {
   const app = express();
   const server = createHttpServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
-  const store = createStore();
+  const store = createStore({ dataPath });
 
   let inviteCode = null;
   let hostToken = null;

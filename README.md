@@ -193,12 +193,20 @@ npx proto-annotation                    # Demo mode (built-in test page)
 
 - Node.js 18+
 
+## Persistent Annotations
+
+Annotations are automatically saved to `.proto-annotation-data.json` in the directory where you run the command. They survive server restarts — stop, restart, and everything is right where you left it.
+
+In collab mode, all annotations from all participants are saved on the host's machine.
+
+The file is plain JSON — you can back it up, share it, or check it into version control if you want a permanent record.
+
 ## Roadmap
 
 - [ ] MCP server for direct Cursor/Claude Code integration (no copy-paste)
 - [ ] Figma link attachments ("should look like this frame")
 - [ ] Screenshot capture (before/after per annotation)
-- [ ] SQLite persistence
+- [ ] @mentions — tag teammates on specific annotations
 
 ## License
 

@@ -1,11 +1,12 @@
 /**
- * Annotation store — in-memory persistence
+ * Annotation store — with optional JSON file persistence
  *
  * Tracks annotations, sessions, stats, and collaboration.
- * Can be swapped to SQLite later for persistence across restarts.
+ * Pass a `dataPath` to persist annotations across server restarts.
  */
 
 import { randomBytes } from 'crypto';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 
 const COLLAB_COLORS = [
   '#e06c75', // rose
@@ -18,10 +19,37 @@ const COLLAB_COLORS = [
   '#be5046', // brick
 ];
 
-export function createStore() {
+export function createStore({ dataPath } = {}) {
   const annotations = new Map();
   const sessions = new Map();
   let collabSession = null;
+
+  // ── Persistence ──
+  function persist() {
+    if (!dataPath) return;
+    try {
+      writeFileSync(dataPath, JSON.stringify({
+        savedAt: new Date().toISOString(),
+        annotations: [...annotations.values()],
+      }, null, 2));
+    } catch {}
+  }
+
+  // Load saved annotations from disk on startup
+  if (dataPath && existsSync(dataPath)) {
+    try {
+      const saved = JSON.parse(readFileSync(dataPath, 'utf8'));
+      for (const a of saved.annotations || []) {
+        annotations.set(a.id, a);
+        // Rebuild sessions index
+        const sessionKey = a.url || 'default';
+        if (!sessions.has(sessionKey)) {
+          sessions.set(sessionKey, { id: sessionKey, url: a.url, createdAt: a.createdAt, annotationCount: 0 });
+        }
+        sessions.get(sessionKey).annotationCount++;
+      }
+    } catch {}
+  }
 
   function genId(prefix = 'ann_') {
     return prefix + randomBytes(4).toString('hex');
@@ -145,6 +173,7 @@ export function createStore() {
       });
     }
     sessions.get(sessionKey).annotationCount++;
+    persist();
 
     return annotation;
   }
@@ -169,6 +198,7 @@ export function createStore() {
       updated.resolvedAt = new Date().toISOString();
     }
     annotations.set(id, updated);
+    persist();
     return updated;
   }
 
@@ -176,6 +206,7 @@ export function createStore() {
     const existing = annotations.get(id);
     if (!existing) return null;
     annotations.delete(id);
+    persist();
     return existing;
   }
 
@@ -203,6 +234,7 @@ export function createStore() {
 
   function clearAll() {
     annotations.clear();
+    persist();
     return true;
   }
 

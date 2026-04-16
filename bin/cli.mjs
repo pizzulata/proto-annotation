@@ -65,6 +65,9 @@ for (let i = 0; i < args.length; i++) {
 // Resolve API key: flag > .env / env var
 if (anthropicKey) process.env.ANTHROPIC_API_KEY = anthropicKey;
 
+// Annotations data file — persists across restarts in the current working directory
+const dataPath = resolve(process.cwd(), '.proto-annotation-data.json');
+
 // If no URL provided, use demo mode
 if (!targetUrl) demo = true;
 
@@ -97,7 +100,7 @@ try {
   version = pkg.version;
 } catch {}
 
-const { server, inviteCode, hostToken } = createServer({ port, targetUrl, demo, collab });
+const { server, inviteCode, hostToken } = createServer({ port, targetUrl, demo, collab, dataPath });
 
 server.listen(port, () => {
   const target = demo ? muted('built-in demo') : link(targetUrl);
