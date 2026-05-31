@@ -1,6 +1,6 @@
 {
   "name": "proto-annotation",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "description": "Design review tool for prototypes. Annotate UI elements, generate agent prompts, paste into Cursor/Claude Code.",
   "bin": {
     "proto-annotation": "bin/cli.mjs"
@@ -10,7 +10,8 @@
     "README.md",
     "bin",
     "src",
-    "demo"
+    "demo/index.html",
+    "demo/styles.css"
   ],
   "scripts": {
     "dev": "node bin/cli.mjs",

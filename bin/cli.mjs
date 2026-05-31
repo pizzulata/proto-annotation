@@ -180,7 +180,7 @@ async function start() {
     if (tunnel) {
       console.log(`  ${faint('Works anywhere — not just your WiFi.')}`);
     } else {
-      console.log(`  ${faint('Share the link above with your team.')}`);
+      console.log(`  ${faint('Share the link above with teammates on the same WiFi.')}`);
       console.log(`  ${faint('Add --tunnel to share outside your network.')}`);
     }
   }
