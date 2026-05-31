@@ -18,8 +18,170 @@ import express from 'express';
 import { createServer as createHttpServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { createStore } from '../lib/store.mjs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { randomBytes, createHash } from 'crypto';
+import { readdir, stat } from 'fs/promises';
+import { join, extname, relative, dirname } from 'path';
+import { fileURLToPath } from 'url';
 
-export function createServer({ port, targetUrl, demo, collab, dataPath }) {
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const DEMO_DIR = join(__dirname, '../../demo');
+
+// ── Fix with AI: file search utilities ──
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.next', 'build', 'out', '.cache', '.nuxt', 'coverage', '.turbo', '.vercel']);
+const SRC_EXTS = new Set(['.tsx', '.jsx', '.ts', '.js', '.css', '.scss', '.sass', '.less', '.vue', '.svelte', '.html', '.astro']);
+
+async function walkDir(dir, files = []) {
+  let entries;
+  try { entries = await readdir(dir); } catch { return files; }
+  for (const entry of entries) {
+    if (SKIP_DIRS.has(entry) || entry.startsWith('.')) continue;
+    const full = join(dir, entry);
+    let s;
+    try { s = await stat(full); } catch { continue; }
+    if (s.isDirectory()) await walkDir(full, files);
+    else if (SRC_EXTS.has(extname(entry))) files.push(full);
+  }
+  return files;
+}
+
+async function findRelevantFiles(srcDir, annotation) {
+  const terms = new Set();
+  if (annotation.cssClasses) annotation.cssClasses.split(/\s+/).filter(Boolean).forEach(c => terms.add(c));
+  if (annotation.selector) {
+    const m = annotation.selector.match(/\.([a-zA-Z0-9_-]+)/g) || [];
+    m.forEach(c => terms.add(c.slice(1)));
+  }
+  if (terms.size === 0 && annotation.element) terms.add(annotation.element);
+  const termList = [...terms];
+  const allFiles = await walkDir(srcDir);
+  const scored = [];
+  for (const file of allFiles) {
+    let content;
+    try { content = readFileSync(file, 'utf8'); } catch { continue; }
+    let score = 0;
+    for (const t of termList) { if (content.includes(t)) score++; }
+    if (score > 0) scored.push({ path: file, score, content });
+  }
+  return scored.sort((a, b) => b.score - a.score).slice(0, 4);
+}
+
+function computeLineDiff(original, proposed) {
+  const oLines = original.split('\n');
+  const pLines = proposed.split('\n');
+  const MAX = Math.max(oLines.length, pLines.length);
+  const changed = new Set();
+  for (let i = 0; i < MAX; i++) { if (oLines[i] !== pLines[i]) changed.add(i); }
+  const show = new Set();
+  changed.forEach(i => { for (let j = Math.max(0, i - 3); j <= Math.min(MAX - 1, i + 3); j++) show.add(j); });
+  const result = [];
+  let last = -1;
+  for (let i = 0; i < MAX; i++) {
+    if (!show.has(i)) continue;
+    if (last !== -1 && i > last + 1) result.push({ type: 'separator' });
+    if (oLines[i] === pLines[i]) {
+      result.push({ type: 'same', line: oLines[i] ?? '', num: i + 1 });
+    } else {
+      if (oLines[i] !== undefined) result.push({ type: 'removed', line: oLines[i], num: i + 1 });
+      if (pLines[i] !== undefined) result.push({ type: 'added', line: pLines[i], num: i + 1 });
+    }
+    last = i;
+  }
+  return result;
+}
+
+// ── Canva OAuth helpers ──
+// Read lazily (ESM imports are hoisted before .env loading in cli.mjs)
+const CANVA_SCOPES    = 'design:content:read design:content:write asset:write asset:read';
+const CANVA_AUTH_URL  = 'https://www.canva.com/api/oauth/authorize';
+const CANVA_TOKEN_URL = 'https://api.canva.com/rest/v1/oauth/token';
+const CANVA_MCP_URL   = 'https://mcp.canva.com/mcp';
+const getCanvaClientId     = () => process.env.CANVA_CLIENT_ID;
+const getCanvaClientSecret = () => process.env.CANVA_CLIENT_SECRET;
+
+// PKCE helpers
+function generateCodeVerifier() { return randomBytes(32).toString('base64url'); }
+function generateCodeChallenge(verifier) { return createHash('sha256').update(verifier).digest('base64url'); }
+
+// In-memory token store
+let canvaToken = null; // { access_token, refresh_token, expires_at }
+let canvaOAuthState = null; // { state, codeVerifier }
+
+async function refreshCanvaToken() {
+  if (!canvaToken?.refresh_token) return false;
+  try {
+    const basic = Buffer.from(`${getCanvaClientId()}:${getCanvaClientSecret()}`).toString('base64');
+    const res = await fetch(CANVA_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Authorization': `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: canvaToken.refresh_token }),
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    canvaToken = { ...data, expires_at: Date.now() + data.expires_in * 1000 };
+    return true;
+  } catch { return false; }
+}
+
+async function getCanvaAccessToken() {
+  if (!canvaToken) return null;
+  if (Date.now() > (canvaToken.expires_at - 60000)) await refreshCanvaToken();
+  return canvaToken?.access_token || null;
+}
+
+async function callCanvaMCP(accessToken, toolName, toolArgs) {
+  // Initialize MCP session
+  const initRes = await fetch(CANVA_MCP_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'proto-annotation', version: '1.0' } } }),
+  });
+
+  if (!initRes.ok) {
+    const body = await initRes.text();
+    throw new Error(`MCP init failed ${initRes.status}: ${body}`);
+  }
+
+  const sessionId = initRes.headers.get('mcp-session-id');
+  const extraHeaders = sessionId ? { 'mcp-session-id': sessionId } : {};
+
+  const toolRes = await fetch(CANVA_MCP_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json, text/event-stream', ...extraHeaders },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: toolName, arguments: toolArgs } }),
+  });
+
+  const contentType = toolRes.headers.get('content-type') || '';
+
+  if (!toolRes.ok) {
+    const body = await toolRes.text();
+    throw new Error(`MCP tool call failed ${toolRes.status}: ${body}`);
+  }
+
+  if (contentType.includes('text/event-stream')) {
+    const text = await toolRes.text();
+    const lines = text.split('\n').filter(l => l.startsWith('data: '));
+    for (const line of lines) {
+      try {
+        const json = JSON.parse(line.slice(6));
+        if (json.result) return json.result;
+        if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
+      } catch (e) {
+        if (e.message !== 'Unexpected token') throw e;
+      }
+    }
+    throw new Error('No result in MCP SSE response');
+  }
+
+  const json = JSON.parse(await toolRes.text());
+  if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
+  return json.result;
+}
+
+export function createServer({ port, targetUrl, demo, collab, dataPath, srcDir }) {
+  // In demo mode, always use the bundled demo directory as the source
+  if (demo) srcDir = DEMO_DIR;
+
   const app = express();
   const server = createHttpServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -47,7 +209,7 @@ export function createServer({ port, targetUrl, demo, collab, dataPath }) {
 
   // ── Serve the review UI ──
   app.get('/', (req, res) => {
-    res.send(buildReviewUI(targetUrl || 'demo', port, demo, collab));
+    res.send(buildReviewUI(targetUrl || 'demo', port, demo, collab, srcDir));
   });
 
   // ── Collab: join page ──
@@ -79,9 +241,24 @@ export function createServer({ port, targetUrl, demo, collab, dataPath }) {
     res.send(buildInjectScript(port));
   });
 
-  // ── Demo page: built-in test UI with the inject script already included ──
+  // ── Demo page: serve real files from demo/ so Fix with AI can edit them ──
   app.get('/demo', (req, res) => {
-    res.type('text/html').send(buildDemoPage());
+    let html;
+    try {
+      html = readFileSync(join(DEMO_DIR, 'index.html'), 'utf8');
+    } catch {
+      return res.type('text/html').send(buildDemoPage());
+    }
+    const injectTag = '<script src="/inject.js"></' + 'script>';
+    html = html.replace('</head>', injectTag + '</head>');
+    res.set('Cache-Control', 'no-store');
+    res.type('text/html').send(html);
+  });
+
+  // ── Demo static assets (no-cache so edits are picked up immediately) ──
+  app.get('/demo/styles.css', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.type('text/css').sendFile(join(DEMO_DIR, 'styles.css'));
   });
 
   // ── Proxy: serve the target app through our server so iframe is same-origin ──
@@ -228,6 +405,335 @@ export function createServer({ port, targetUrl, demo, collab, dataPath }) {
     }).catch(() => {}); // never block on this
 
     res.json({ fakeDoor: true });
+  });
+
+  // ── API: Fix with AI ──
+  const pendingFixes = new Map(); // annotationId → { absPath, relPath, original, proposed }
+
+  app.post('/api/fix/:id', async (req, res) => {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return res.status(400).json({ error: 'no_key', message: 'Add ANTHROPIC_API_KEY to your .env to use Fix with AI' });
+    if (!srcDir) return res.status(400).json({ error: 'no_src', message: 'No source directory available' });
+
+    const annotation = store.getAnnotations({}).find(a => a.id === req.params.id);
+    if (!annotation) return res.status(404).json({ error: 'Not found' });
+
+    let candidates;
+    try { candidates = await findRelevantFiles(srcDir, annotation); } catch (e) { return res.status(500).json({ error: e.message }); }
+    if (candidates.length === 0) return res.status(422).json({ error: 'no_files', message: 'No source files found matching this element. Make sure you\'re running from your project root.' });
+
+    const fileContext = candidates.map(f => `=== ${relative(srcDir, f.path)} ===\n${f.content}`).join('\n\n');
+    const userMsg = `Designer feedback: "${annotation.comment}"
+Element: <${annotation.element || 'unknown'}> ${annotation.selector || ''}
+Type: ${annotation.type}  Labels: ${(annotation.labels || []).join(', ')}
+Current CSS: ${JSON.stringify(annotation.computedStyles || {})}
+Dimensions: ${annotation.boundingBox ? `${Math.round(annotation.boundingBox.width)}x${Math.round(annotation.boundingBox.height)}px` : 'unknown'}
+
+Source files (most relevant first):
+${fileContext}
+
+Make the minimal targeted change to implement this feedback. Use write_file to output the complete modified file.`;
+
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-5',
+          max_tokens: 8192,
+          system: `You are a surgical UI code editor. A designer annotated an element with feedback.
+Make the SMALLEST possible change to implement their feedback. Rules:
+- Change only what the designer asked for. Do not refactor, rename, or restructure anything else.
+- Preserve all formatting, whitespace, and code style exactly.
+- For CSS/SCSS: update only the specific property value.
+- For components: update only the relevant className, style prop, or tailwind class.
+- Use write_file with the COMPLETE file content after your change.
+- Pick the most specific file (e.g. component file over global CSS).
+- If you truly cannot identify the right change, explain why instead of guessing.`,
+          tools: [{
+            name: 'write_file',
+            description: 'Write the complete modified file with your fix applied',
+            input_schema: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'Relative file path from project root (e.g. src/components/Button.tsx)' },
+                content: { type: 'string', description: 'Complete file content after applying the fix' }
+              },
+              required: ['path', 'content']
+            }
+          }],
+          messages: [{ role: 'user', content: userMsg }]
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        return res.status(502).json({ error: err.error?.message || 'Claude API error' });
+      }
+
+      const data = await response.json();
+      const toolUse = data.content?.find(b => b.type === 'tool_use' && b.name === 'write_file');
+
+      if (!toolUse) {
+        const text = data.content?.find(b => b.type === 'text')?.text || 'Claude could not identify the change needed.';
+        return res.status(422).json({ error: 'no_change', message: text });
+      }
+
+      const { path: relPath, content: proposed } = toolUse.input;
+      const absPath = join(srcDir, relPath);
+      if (!existsSync(absPath)) return res.status(404).json({ error: 'file_not_found', message: `File not found: ${relPath}` });
+
+      const original = readFileSync(absPath, 'utf8');
+      if (original === proposed) return res.json({ noChange: true });
+
+      const diff = computeLineDiff(original, proposed);
+      pendingFixes.set(req.params.id, { absPath, relPath, original, proposed });
+      res.json({ diff, relPath });
+
+    } catch (err) {
+      res.status(502).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/fix/:id/apply', (req, res) => {
+    const fix = pendingFixes.get(req.params.id);
+    if (!fix) return res.status(404).json({ error: 'No pending fix' });
+    try {
+      writeFileSync(fix.absPath, fix.proposed);
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+    pendingFixes.delete(req.params.id);
+    const updated = store.updateAnnotation(req.params.id, { status: 'fixed', fixedFile: fix.relPath });
+    if (updated) broadcast({ type: 'annotation.updated', payload: updated });
+    res.json({ ok: true, file: fix.relPath });
+  });
+
+  app.post('/api/fix/:id/discard', (req, res) => {
+    pendingFixes.delete(req.params.id);
+    res.json({ ok: true });
+  });
+
+  // ── API: Share to Slack ──
+  app.post('/api/slack/share', async (req, res) => {
+    const { webhookUrl } = req.body;
+    if (!webhookUrl || !webhookUrl.startsWith('https://hooks.slack.com/')) {
+      return res.status(400).json({ error: 'Invalid Slack webhook URL' });
+    }
+
+    const annotations = store.getAnnotations({ status: 'pending' });
+    if (annotations.length === 0) {
+      return res.status(400).json({ error: 'No pending annotations to share' });
+    }
+
+    const pageLabel = targetUrl || 'prototype';
+    const typeOrder = { bug: 0, feedback: 1, question: 2 };
+    const sorted = [...annotations].sort((a, b) => (typeOrder[a.type] ?? 1) - (typeOrder[b.type] ?? 1));
+
+    const intentLabel = { bug: '🐛 BUG', feedback: '🔧 CHANGE', question: '❓ QUESTION' };
+    const lines = sorted.map((a, i) => {
+      const intent = intentLabel[a.type] || '🔧 CHANGE';
+      const selector = a.selector || a.element || 'unknown';
+      const labels = (a.labels || []).join(', ');
+      let line = `*${i + 1}. ${intent}:* ${a.comment || '(no comment)'}`;
+      line += `\n   \`${selector}\``;
+      if (labels) line += ` · ${labels}`;
+      if (a.author?.name) line += ` · _by ${a.author.name}_`;
+      return line;
+    }).join('\n\n');
+
+    const totalBugs = sorted.filter(a => a.type === 'bug').length;
+    const summary = [
+      totalBugs > 0 ? `${totalBugs} bug${totalBugs !== 1 ? 's' : ''}` : null,
+      sorted.filter(a => a.type === 'feedback').length > 0 ? `${sorted.filter(a => a.type === 'feedback').length} change${sorted.filter(a => a.type === 'feedback').length !== 1 ? 's' : ''}` : null,
+      sorted.filter(a => a.type === 'question').length > 0 ? `${sorted.filter(a => a.type === 'question').length} question${sorted.filter(a => a.type === 'question').length !== 1 ? 's' : ''}` : null,
+    ].filter(Boolean).join(', ');
+
+    const slackBody = {
+      text: `Design Review — ${pageLabel} — ${annotations.length} annotation${annotations.length !== 1 ? 's' : ''}`,
+      blocks: [
+        {
+          type: 'header',
+          text: { type: 'plain_text', text: `📋 Design Review — ${pageLabel}`, emoji: true }
+        },
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: `${summary} ready for dev\n\n${lines}` }
+        },
+        { type: 'divider' },
+        {
+          type: 'context',
+          elements: [{ type: 'mrkdwn', text: 'Sent via <https://github.com/pizzulata/proto-annotation|proto-annotation>' }]
+        }
+      ]
+    };
+
+    try {
+      const slackRes = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(slackBody),
+      });
+      if (!slackRes.ok) {
+        const text = await slackRes.text().catch(() => '');
+        return res.status(502).json({ error: `Slack error: ${text || slackRes.status}` });
+      }
+      res.json({ ok: true, count: annotations.length });
+    } catch (err) {
+      res.status(502).json({ error: err.message });
+    }
+  });
+
+  // ── API: Canva OAuth ──
+  app.get('/api/canva/status', (req, res) => {
+    res.json({
+      connected: !!canvaToken,
+      enabled: !!(getCanvaClientId() && getCanvaClientSecret()),
+    });
+  });
+
+  app.get('/api/canva/auth', (req, res) => {
+    if (!getCanvaClientId() || !getCanvaClientSecret()) {
+      return res.status(400).send('getCanvaClientId() and getCanvaClientSecret() not set in .env');
+    }
+    const codeVerifier = generateCodeVerifier();
+    const codeChallenge = generateCodeChallenge(codeVerifier);
+    const state = randomBytes(16).toString('hex');
+    canvaOAuthState = { state, codeVerifier };
+    const redirectUri = `http://127.0.0.1:${port}/api/canva/callback`;
+    const params = new URLSearchParams({
+      code_challenge_method: 'S256',
+      response_type: 'code',
+      client_id: getCanvaClientId(),
+      redirect_uri: redirectUri,
+      scope: CANVA_SCOPES,
+      state,
+      code_challenge: codeChallenge,
+    });
+    res.redirect(`${CANVA_AUTH_URL}?${params}`);
+  });
+
+  app.get('/api/canva/callback', async (req, res) => {
+    const { code, state, error } = req.query;
+    if (error) return res.send(`<script>window.close();</script><p>Canva auth error: ${error}</p>`);
+    if (!canvaOAuthState || state !== canvaOAuthState.state) return res.status(400).send('Invalid state');
+    try {
+      const redirectUri = `http://127.0.0.1:${port}/api/canva/callback`;
+      const basic = Buffer.from(`${getCanvaClientId()}:${getCanvaClientSecret()}`).toString('base64');
+      const tokenRes = await fetch(CANVA_TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Authorization': `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri, code_verifier: canvaOAuthState.codeVerifier }),
+      });
+      if (!tokenRes.ok) {
+        const err = await tokenRes.text();
+        return res.send(`<script>window.close();</script><p>Token error: ${err}</p>`);
+      }
+      const data = await tokenRes.json();
+      canvaToken = { ...data, expires_at: Date.now() + data.expires_in * 1000 };
+      canvaOAuthState = null;
+      res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0a0b0d;color:#e4e7ef">
+        <div style="text-align:center">
+          <div style="font-size:32px;margin-bottom:12px">✓</div>
+          <div style="font-size:16px;font-weight:600">Canva connected</div>
+          <div style="font-size:13px;color:#9da3b3;margin-top:8px">You can close this window.</div>
+        </div>
+        <script>setTimeout(() => window.close(), 1500);</script>
+      </body></html>`);
+    } catch (err) {
+      res.status(500).send(`Error: ${err.message}`);
+    }
+  });
+
+  app.post('/api/canva/disconnect', (req, res) => {
+    canvaToken = null;
+    res.json({ ok: true });
+  });
+
+  app.post('/api/canva/export', async (req, res) => {
+    if (!canvaToken) return res.status(401).json({ error: 'Canva not connected. Click "Connect Canva" first.' });
+    const accessToken = await getCanvaAccessToken();
+    if (!accessToken) return res.status(401).json({ error: 'Canva token expired. Please reconnect.' });
+
+    const annotations = store.getAnnotations({ status: 'pending' });
+    if (annotations.length === 0) return res.status(400).json({ error: 'No pending annotations to export.' });
+
+    // Build the doc query
+    const pageLabel = targetUrl || 'prototype';
+    const today = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+    const typeOrder = { bug: 0, feedback: 1, question: 2 };
+    const intentLabel = { bug: '🐛 BUG', feedback: '🔧 CHANGE', question: '❓ QUESTION' };
+    const sorted = [...annotations].sort((a, b) => (typeOrder[a.type] ?? 1) - (typeOrder[b.type] ?? 1));
+
+    const sections = sorted.map((a, i) => {
+      const intent = intentLabel[a.type] || '🔧 CHANGE';
+      const selector = a.selector || a.element || 'unknown';
+      const labels = (a.labels || []).join(', ');
+      const styles = a.computedStyles || {};
+      const box = a.boundingBox;
+      const baseline = [
+        box ? `${Math.round(box.width)}×${Math.round(box.height)}px` : null,
+        styles.fontSize ? `font-size: ${styles.fontSize}` : null,
+        styles.padding && styles.padding !== '0px' ? `padding: ${styles.padding}` : null,
+        styles.bg && styles.bg !== 'rgba(0, 0, 0, 0)' ? `bg: ${styles.bg}` : null,
+        styles.color ? `color: ${styles.color}` : null,
+      ].filter(Boolean).join(' | ');
+
+      return `### ${i + 1}. ${intent}: ${a.comment || '(no comment)'}
+Element: ${selector}${a.elementPath ? `\nPath: ${a.elementPath}` : ''}${labels ? `\nLabels: ${labels}` : ''}${baseline ? `\nBaseline: ${baseline}` : ''}${a.author?.name ? `\nBy: ${a.author.name}` : ''}
+Status: Pending`;
+    }).join('\n\n---\n\n');
+
+    const query = `Create a professional design review report document.
+
+Header:
+Project: ${pageLabel}
+Reviewed by: ${sorted.find(a => a.author?.name)?.author?.name || 'Simone'}
+Date: ${today}
+Total: ${annotations.length} pending annotation${annotations.length !== 1 ? 's' : ''}
+Summary: ${sorted.filter(a=>a.type==='bug').length} bugs · ${sorted.filter(a=>a.type==='feedback').length} changes · ${sorted.filter(a=>a.type==='question').length} questions
+
+Annotations:
+
+${sections}
+
+Clean, minimal professional style for sharing with a development team.`;
+
+    try {
+      const result = await callCanvaMCP(accessToken, 'generate-design', {
+        query,
+        design_type: 'doc',
+        user_intent: 'Generate a design review report doc from proto-annotation session',
+      });
+
+      // Extract candidates from result
+      const candidates = result?.content?.[0]?.text
+        ? JSON.parse(result.content[0].text)?.generated_designs
+        : result?.generated_designs;
+
+      if (!candidates?.length) {
+        return res.status(502).json({ error: 'No design candidates returned from Canva.' });
+      }
+
+      // Auto-select first candidate
+      const first = candidates[0];
+      const jobId = result?.job?.id || result?.id;
+
+      // Create design from first candidate
+      const createResult = await callCanvaMCP(accessToken, 'create-design-from-candidate', {
+        job_id: jobId,
+        candidate_id: first.candidate_id,
+        user_intent: 'Save design review report to Canva account',
+      });
+
+      const editUrl = createResult?.content?.[0]?.text
+        ? JSON.parse(createResult.content[0].text)?.design_summary?.urls?.edit_url
+        : createResult?.design_summary?.urls?.edit_url;
+
+      res.json({ ok: true, url: editUrl || first.url });
+    } catch (err) {
+      res.status(502).json({ error: err.message });
+    }
   });
 
   // ── WebSocket broadcast ──
@@ -459,7 +965,7 @@ function buildAgentPrompt(annotations, pageUrl) {
 // REVIEW UI HTML — the main page the designer sees
 // ═══════════════════════════════════════════════════════════════
 
-function buildReviewUI(targetUrl, port, demo, collab) {
+function buildReviewUI(targetUrl, port, demo, collab, srcDir) {
   const iframeSrc = demo ? '/demo' : '/proxy/';
   return `<!DOCTYPE html>
 <html lang="en">
@@ -621,6 +1127,42 @@ function buildReviewUI(targetUrl, port, demo, collab) {
   .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(16px); background: var(--surface2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 18px; font-size: 12px; font-family: var(--font-mono); color: var(--text); z-index: 99999; opacity: 0; transition: all 0.2s; pointer-events: none; box-shadow: var(--shadow-lg); }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
+  /* ── Canva connect button ── */
+  .canva-btn { padding: 5px 9px; display:flex; align-items:center; gap:5px; font-size:11px; font-family:var(--font-mono); border-radius:7px; border:1px solid var(--border); background:var(--surface3); color:var(--text-secondary); cursor:pointer; transition:all var(--transition); }
+  .canva-btn:hover { border-color:var(--border-hover); color:var(--text); }
+  .canva-btn.connected { border-color:#7c3aed55; background:#1a0d2e; color:#a78bfa; }
+  .canva-btn.connected:hover { opacity:0.85; }
+  .canva-btn svg { flex-shrink:0; }
+
+  /* ── Slack share modal ── */
+  .slack-modal { position: fixed; inset: 0; z-index: 3000; display: flex; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.2s; }
+  .slack-modal.open { opacity: 1; pointer-events: all; }
+  .slack-modal-bg { position: absolute; inset: 0; background: rgba(0,0,0,0.65); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+  .slack-modal-panel { position: relative; width: 480px; max-width: calc(100vw - 32px); background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-xl); padding: 20px 22px; transform: translateY(8px); transition: transform 0.2s; }
+  .slack-modal.open .slack-modal-panel { transform: translateY(0); }
+  .slack-modal-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+  .slack-modal-sub { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+  .slack-modal-label { font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  .slack-modal-input { width: 100%; padding: 9px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; color: var(--text); font-size: 12px; font-family: var(--font-mono); outline: none; transition: border-color var(--transition); }
+  .slack-modal-input:focus { border-color: var(--accent); }
+  .slack-preview { margin-top: 14px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; max-height: 200px; overflow-y: auto; }
+  .slack-preview-line { font-size: 11px; font-family: var(--font-mono); color: var(--text-secondary); line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+  .slack-modal-footer { display: flex; gap: 8px; margin-top: 16px; align-items: center; }
+  .slack-modal-close { position: absolute; top: 14px; right: 16px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 20px; padding: 2px 6px; border-radius: 4px; line-height: 1; transition: all var(--transition); }
+  .slack-modal-close:hover { background: var(--surface2); color: var(--text-secondary); }
+  .slack-send-btn { padding: 8px 18px; background: #4A154B; color: #fff; border: none; border-radius: 7px; font-size: 12px; font-weight: 600; font-family: var(--font-sans); cursor: pointer; transition: opacity var(--transition); display: flex; align-items: center; gap: 7px; }
+  .slack-send-btn:hover:not(:disabled) { opacity: 0.88; }
+  .slack-send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .slack-hint { font-size: 11px; color: var(--muted); line-height: 1.4; }
+
+  /* Fix with AI veil — fades over the prototype while the change is applied */
+  @keyframes veil-pulse {
+    0%, 100% { opacity: 0.65; }
+    50%       { opacity: 0.85; }
+  }
+  .fix-veil { position: fixed; inset: 0; z-index: 500; background: rgba(10,11,13,0); pointer-events: none; transition: background 0.5s cubic-bezier(0.4,0,0.2,1), opacity 0.5s ease; }
+  .fix-veil.active { background: rgba(10,11,13,0.72); pointer-events: all; animation: veil-pulse 1.8s ease-in-out infinite; }
+
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
@@ -659,7 +1201,21 @@ function buildReviewUI(targetUrl, port, demo, collab) {
   .po-btn.copy-p { color: var(--green); border-color: var(--green-soft); background: var(--green-soft); }
   .po-btn.copy-p:hover:not(:disabled) { opacity: 0.85; }
   .po-btn.revert-p { color: var(--amber); border-color: var(--amber-soft); background: var(--amber-soft); }
+  .po-btn.fix-ai { color: #98c379; border-color: #2d4a2d; background: #1a2e1a; }
+  .po-btn.fix-ai:hover:not(:disabled) { opacity: 0.85; }
+  .po-btn.apply-fix { color: #98c379; border-color: #2d5a3a; background: #1a3a2a; font-weight: 500; }
+  .po-btn.apply-fix:hover:not(:disabled) { opacity: 0.85; }
+  .po-btn.discard-fix { color: var(--text-secondary); }
   .po-status { font-size: 10px; color: var(--muted); font-family: var(--font-mono); margin-left: auto; }
+  .po-diff { font-family: var(--font-mono); font-size: 11px; overflow-x: auto; }
+  .po-diff-file { padding: 8px 14px 6px; font-size: 10px; color: var(--muted); border-bottom: 1px solid var(--border); }
+  .po-diff-sep { padding: 2px 14px; color: var(--muted); font-size: 10px; background: var(--surface2); }
+  .po-diff-line { display: flex; padding: 1px 14px; white-space: pre; }
+  .po-diff-line.same { color: var(--text-secondary); }
+  .po-diff-line.removed { background: #2d1515; color: #e06c75; }
+  .po-diff-line.added { background: #152d1e; color: #98c379; }
+  .po-diff-num { min-width: 32px; opacity: 0.4; user-select: none; margin-right: 10px; }
+  .po-diff-prefix { min-width: 12px; margin-right: 6px; }
 </style>
 </head>
 <body>
@@ -682,6 +1238,13 @@ function buildReviewUI(targetUrl, port, demo, collab) {
   <button class="tb-btn" id="jsonBtn" disabled onclick="copyJSON()">JSON</button>
   <button class="tb-btn danger" id="clearBtn" disabled onclick="clearAll()">Clear</button>
   <div class="sep"></div>
+  <button class="canva-btn" id="canvaBtn" onclick="handleCanvaClick()" title="Export to Canva">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm0 2c5.523 0 10 4.477 10 10s-4.477 10-10 10S2 17.523 2 12 6.477 2 12 2zm2.5 5.5c-1.5 0-2.7.8-3.3 2-.4-.2-.8-.3-1.2-.3-1.7 0-3 1.3-3 3s1.3 3 3 3c.5 0 1-.1 1.4-.4.7.9 1.7 1.4 2.8 1.4 2.2 0 3.8-1.8 3.8-4s-1.7-3.7-3.5-3.7z"/></svg>
+    <span id="canvaBtnLabel">Export</span>
+  </button>
+  <button class="tb-btn" id="slackBtn" title="Share to Slack" onclick="openSlackModal()" style="padding:5px 9px;">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="display:block"><path d="M6.194 14.644c0 1.16-.943 2.107-2.107 2.107a2.11 2.11 0 0 1-2.107-2.107c0-1.16.943-2.107 2.107-2.107H6.194v2.107zm1.062 0c0-1.16.943-2.107 2.107-2.107 1.16 0 2.107.943 2.107 2.107v5.27c0 1.16-.943 2.107-2.107 2.107a2.11 2.11 0 0 1-2.107-2.107v-5.27zM9.363 6.194a2.11 2.11 0 0 1-2.107-2.107c0-1.16.943-2.107 2.107-2.107 1.16 0 2.107.943 2.107 2.107V6.194H9.363zm0 1.062c1.16 0 2.107.943 2.107 2.107a2.11 2.11 0 0 1-2.107 2.107H4.087A2.11 2.11 0 0 1 1.98 9.363c0-1.16.943-2.107 2.107-2.107h5.276zm8.45 2.107c0-1.16.943-2.107 2.107-2.107a2.11 2.11 0 0 1 2.107 2.107 2.11 2.11 0 0 1-2.107 2.107H17.813V9.363zm-1.062 0c0 1.16-.943 2.107-2.107 2.107a2.11 2.11 0 0 1-2.107-2.107V4.087c0-1.16.943-2.107 2.107-2.107a2.11 2.11 0 0 1 2.107 2.107v5.276zm-2.107 8.45c1.16 0 2.107.943 2.107 2.107a2.11 2.11 0 0 1-2.107 2.107 2.11 2.11 0 0 1-2.107-2.107V17.813h2.107zm0-1.062a2.11 2.11 0 0 1-2.107-2.107c0-1.16.943-2.107 2.107-2.107h5.276c1.16 0 2.107.943 2.107 2.107a2.11 2.11 0 0 1-2.107 2.107H14.644z"/></svg>
+  </button>
   <button class="panel-toggle" id="panelToggle" onclick="togglePanel()">☰</button>
 </div>
 
@@ -737,17 +1300,47 @@ function buildReviewUI(targetUrl, port, demo, collab) {
     </div>
     <div class="prompt-overlay-body" id="poBody">
       <div class="prompt-overlay-text" id="poText"></div>
+      <div class="po-diff" id="poDiff" style="display:none"></div>
     </div>
     <div class="prompt-overlay-footer">
       <button class="po-btn enhance" id="poEnhance">✨ Enhance</button>
       <button class="po-btn" id="poEdit">✏️ Edit</button>
       <button class="po-btn revert-p" id="poRevert" style="display:none">Revert</button>
       <button class="po-btn copy-p" id="poCopy">Copy</button>
+      <button class="po-btn fix-ai" id="poFix">🔧 Fix with AI</button>
+      <button class="po-btn apply-fix" id="poApply" style="display:none">Apply fix</button>
+      <button class="po-btn discard-fix" id="poDiscard" style="display:none">Discard</button>
       <span class="po-status" id="poStatus"></span>
     </div>
   </div>
 </div>
 
+<!-- Slack share modal -->
+<div class="slack-modal" id="slackModal">
+  <div class="slack-modal-bg" onclick="closeSlackModal()"></div>
+  <div class="slack-modal-panel">
+    <button class="slack-modal-close" onclick="closeSlackModal()">&times;</button>
+    <div class="slack-modal-title">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="#4A154B"><path d="M6.194 14.644c0 1.16-.943 2.107-2.107 2.107a2.11 2.11 0 0 1-2.107-2.107c0-1.16.943-2.107 2.107-2.107H6.194v2.107zm1.062 0c0-1.16.943-2.107 2.107-2.107 1.16 0 2.107.943 2.107 2.107v5.27c0 1.16-.943 2.107-2.107 2.107a2.11 2.11 0 0 1-2.107-2.107v-5.27zM9.363 6.194a2.11 2.11 0 0 1-2.107-2.107c0-1.16.943-2.107 2.107-2.107 1.16 0 2.107.943 2.107 2.107V6.194H9.363zm0 1.062c1.16 0 2.107.943 2.107 2.107a2.11 2.11 0 0 1-2.107 2.107H4.087A2.11 2.11 0 0 1 1.98 9.363c0-1.16.943-2.107 2.107-2.107h5.276zm8.45 2.107c0-1.16.943-2.107 2.107-2.107a2.11 2.11 0 0 1 2.107 2.107 2.11 2.11 0 0 1-2.107 2.107H17.813V9.363zm-1.062 0c0 1.16-.943 2.107-2.107 2.107a2.11 2.11 0 0 1-2.107-2.107V4.087c0-1.16.943-2.107 2.107-2.107a2.11 2.11 0 0 1 2.107 2.107v5.276zm-2.107 8.45c1.16 0 2.107.943 2.107 2.107a2.11 2.11 0 0 1-2.107 2.107 2.11 2.11 0 0 1-2.107-2.107V17.813h2.107zm0-1.062a2.11 2.11 0 0 1-2.107-2.107c0-1.16.943-2.107 2.107-2.107h5.276c1.16 0 2.107.943 2.107 2.107a2.11 2.11 0 0 1-2.107 2.107H14.644z"/></svg>
+      Share to Slack
+    </div>
+    <div class="slack-modal-sub" id="slackSub">Post your pending annotations to a Slack channel.</div>
+    <div class="slack-modal-label">Webhook URL</div>
+    <input class="slack-modal-input" id="slackWebhookInput" type="url" placeholder="https://hooks.slack.com/services/..." oninput="updateSlackPreview()" />
+    <div class="slack-preview" id="slackPreview">
+      <div class="slack-preview-line" id="slackPreviewText">Enter a webhook URL to preview the message.</div>
+    </div>
+    <div class="slack-modal-footer">
+      <button class="slack-send-btn" id="slackSendBtn" onclick="sendToSlack()" disabled>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+        Send to Slack
+      </button>
+      <span class="slack-hint" id="slackHint">Webhook URL is saved locally.</span>
+    </div>
+  </div>
+</div>
+
+<div class="fix-veil" id="fixVeil"></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -766,6 +1359,7 @@ function buildReviewUI(targetUrl, port, demo, collab) {
   let myParticipant = null;
   let participants = [];
   const isCollab = ${collab ? 'true' : 'false'};
+  const isDemo = ${demo ? 'true' : 'false'};
 
   const prototypeFrame = document.getElementById('prototypeFrame');
 
@@ -1166,6 +1760,129 @@ function buildReviewUI(targetUrl, port, demo, collab) {
     fetch('/api/annotations', { method: 'DELETE', headers: authHeaders() });
     showToast('All annotations cleared');
   }
+
+  // ═══ CANVA EXPORT ═══
+  let canvaConnected = false;
+
+  async function checkCanvaStatus() {
+    try {
+      const res = await fetch('/api/canva/status');
+      const data = await res.json();
+      canvaConnected = data.connected;
+      const btn = document.getElementById('canvaBtn');
+      const label = document.getElementById('canvaBtnLabel');
+      if (!data.enabled) { btn.style.display = 'none'; return; }
+      if (data.connected) {
+        btn.classList.add('connected');
+        label.textContent = 'Export to Canva';
+      } else {
+        btn.classList.remove('connected');
+        label.textContent = 'Connect Canva';
+      }
+    } catch {}
+  }
+
+  async function handleCanvaClick() {
+    if (!canvaConnected) {
+      // Open OAuth in a popup
+      const popup = window.open('/api/canva/auth', 'canva-auth', 'width=600,height=700,left=200,top=100');
+      // Poll until popup closes
+      const poll = setInterval(async () => {
+        if (popup.closed) {
+          clearInterval(poll);
+          await checkCanvaStatus();
+          if (canvaConnected) showToast('✓ Canva connected');
+        }
+      }, 500);
+    } else {
+      await exportToCanva();
+    }
+  }
+
+  async function exportToCanva() {
+    showToast('Canva doc export — coming soon 🚀');
+  }
+
+  // Check status on load
+  checkCanvaStatus();
+
+  // ═══ SLACK SHARE ═══
+  function openSlackModal() {
+    const modal = document.getElementById('slackModal');
+    const input = document.getElementById('slackWebhookInput');
+    // Restore saved webhook
+    const saved = localStorage.getItem('proto-slack-webhook') || '';
+    input.value = saved;
+    modal.classList.add('open');
+    updateSlackPreview();
+    setTimeout(() => input.focus(), 150);
+  }
+  function closeSlackModal() {
+    document.getElementById('slackModal').classList.remove('open');
+  }
+  function buildSlackPreview() {
+    const pending = annotations.filter(a => a.status === 'pending');
+    if (pending.length === 0) return '(no pending annotations to share)';
+    const intentLabel = { bug: '🐛 BUG', feedback: '🔧 CHANGE', question: '❓ QUESTION' };
+    const lines = pending.map((a, i) => {
+      const intent = intentLabel[a.type] || '🔧 CHANGE';
+      const selector = a.selector || a.element || 'unknown';
+      const labels = (a.labels || []).join(', ');
+      let line = (i + 1) + '. *' + intent + ':* ' + (a.comment || '(no comment)');
+      line += '\\n   ' + selector;
+      if (labels) line += ' · ' + labels;
+      if (a.author?.name) line += ' · by ' + a.author.name;
+      return line;
+    }).join('\\n\\n');
+    return '📋 Design Review — ' + (pageUrl || 'prototype') + '\\n\\n' + lines;
+  }
+  function updateSlackPreview() {
+    const input = document.getElementById('slackWebhookInput');
+    const preview = document.getElementById('slackPreviewText');
+    const sendBtn = document.getElementById('slackSendBtn');
+    const sub = document.getElementById('slackSub');
+    const pending = annotations.filter(a => a.status === 'pending');
+    const validUrl = input.value.startsWith('https://hooks.slack.com/');
+    preview.textContent = buildSlackPreview();
+    sendBtn.disabled = !validUrl || pending.length === 0;
+    if (pending.length === 0) sub.textContent = 'No pending annotations to share.';
+    else sub.textContent = pending.length + ' pending annotation' + (pending.length !== 1 ? 's' : '') + ' will be posted.';
+  }
+  async function sendToSlack() {
+    const input = document.getElementById('slackWebhookInput');
+    const sendBtn = document.getElementById('slackSendBtn');
+    const hint = document.getElementById('slackHint');
+    const webhookUrl = input.value.trim();
+    if (!webhookUrl) return;
+    localStorage.setItem('proto-slack-webhook', webhookUrl);
+    sendBtn.disabled = true;
+    sendBtn.textContent = 'Sending…';
+    hint.textContent = '';
+    try {
+      const res = await fetch('/api/slack/share', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ webhookUrl }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        closeSlackModal();
+        showToast('✓ Sent ' + data.count + ' annotation' + (data.count !== 1 ? 's' : '') + ' to Slack');
+      } else {
+        hint.textContent = data.error || 'Send failed.';
+      }
+    } catch (e) {
+      hint.textContent = 'Network error: ' + e.message;
+    } finally {
+      sendBtn.disabled = false;
+      sendBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg> Send to Slack';
+    }
+  }
+  document.getElementById('slackModal').addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeSlackModal();
+    if (e.key === 'Enter' && !document.getElementById('slackSendBtn').disabled) sendToSlack();
+  });
+
   function updateButtons() {
     const has = annotations.length > 0;
     document.getElementById('copyBtn').disabled = !has;
@@ -1225,6 +1942,11 @@ function buildReviewUI(targetUrl, port, demo, collab) {
   document.getElementById('poEdit').addEventListener('click', toggleOverlayEdit);
   document.getElementById('poRevert').addEventListener('click', revertOverlayPrompt);
   document.getElementById('poCopy').addEventListener('click', copyOverlayPrompt);
+  if (document.getElementById('poFix')) {
+    document.getElementById('poFix').addEventListener('click', fixWithAI);
+    document.getElementById('poApply').addEventListener('click', applyFix);
+    document.getElementById('poDiscard').addEventListener('click', discardFix);
+  }
 
   // Close on Escape
   document.addEventListener('keydown', (e) => {
@@ -1292,6 +2014,11 @@ function buildReviewUI(targetUrl, port, demo, collab) {
     if (ta && currentOverlayId) {
       promptOverrides[currentOverlayId] = rebuildWithComment(currentOverlayId, ta.value);
     }
+    // Auto-discard any pending fix (fire-and-forget, don't call poShowPromptView here
+    // because #poText may not exist if edit mode was active — openPromptOverlay resets UI on next open)
+    if (currentOverlayId) {
+      fetch('/api/fix/' + currentOverlayId + '/discard', { method: 'POST' }).catch(() => {});
+    }
     document.getElementById('promptOverlay').classList.remove('open');
     currentOverlayId = null;
   }
@@ -1345,6 +2072,97 @@ function buildReviewUI(targetUrl, port, demo, collab) {
       enhBtn.disabled = false;
     }
   }
+
+  // ── Fix with AI ──
+  function poShowPromptView() {
+    document.getElementById('poText').style.display = '';
+    document.getElementById('poDiff').style.display = 'none';
+    const fixBtn = document.getElementById('poFix');
+    if (fixBtn) { fixBtn.style.display = ''; fixBtn.disabled = false; }
+    document.getElementById('poApply').style.display = 'none';
+    document.getElementById('poDiscard').style.display = 'none';
+    document.getElementById('poEnhance').style.display = '';
+    document.getElementById('poEdit').style.display = '';
+    document.getElementById('poCopy').style.display = '';
+    document.getElementById('poStatus').textContent = '';
+  }
+
+  function renderDiffHTML(diff, relPath) {
+    const esc = s => (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const lines = diff.map(d => {
+      if (d.type === 'separator') return '<div class="po-diff-sep">&hellip;</div>';
+      const prefix = d.type === 'added' ? '+' : d.type === 'removed' ? '-' : ' ';
+      return '<div class="po-diff-line ' + d.type + '">'
+        + '<span class="po-diff-num">' + (d.type === 'separator' ? '' : d.num) + '</span>'
+        + '<span class="po-diff-prefix">' + prefix + '</span>'
+        + '<span>' + esc(d.line) + '</span>'
+        + '</div>';
+    }).join('');
+    return '<div class="po-diff-file">' + esc(relPath) + '</div>' + lines;
+  }
+
+  async function fixWithAI() {
+    if (!currentOverlayId) return;
+    const id = currentOverlayId;
+
+    // 1. Close modal + panel immediately — manual close to avoid firing discard
+    //    which would race with the upcoming /api/fix/:id call
+    document.getElementById('promptOverlay').classList.remove('open');
+    currentOverlayId = null;
+    if (panelOpen) togglePanel();
+
+    // 2. Bring veil in — prototype stays visible underneath while Claude works
+    const veil = document.getElementById('fixVeil');
+    veil.classList.add('active');
+    const dismissVeil = () => veil.classList.remove('active');
+
+    try {
+      // 3. Ask Claude to analyse and produce a fix
+      const fixRes = await fetch('/api/fix/' + id, { method: 'POST' });
+      const fixData = await fixRes.json();
+
+      if (!fixRes.ok || fixData.error) {
+        dismissVeil();
+        showToast(fixData.message || fixData.error || 'Fix failed');
+        return;
+      }
+      if (fixData.noChange) {
+        dismissVeil();
+        showToast('No changes needed');
+        return;
+      }
+
+      // 4. Auto-apply the fix
+      const applyRes = await fetch('/api/fix/' + id + '/apply', { method: 'POST' });
+      const applyData = await applyRes.json();
+
+      if (applyData.ok) {
+        // 5. Reload iframe behind the veil, then lift it to reveal the change
+        prototypeFrame.addEventListener('load', () => {
+          dismissVeil();
+          setTimeout(() => showToast('\\u2713 Fix applied \\u2014 ' + applyData.file), 500);
+        }, { once: true });
+        prototypeFrame.contentWindow.location.reload();
+      } else {
+        dismissVeil();
+        showToast(applyData.error || 'Error applying fix');
+      }
+    } catch (e) {
+      dismissVeil();
+      showToast('Error: ' + e.message);
+    }
+  }
+
+  // kept for backwards-compat but no longer wired to a button
+  async function applyFix() {}
+
+  async function discardFix() {
+    if (!currentOverlayId) return;
+    await fetch('/api/fix/' + currentOverlayId + '/discard', { method: 'POST' }).catch(() => {});
+    poShowPromptView();
+    document.getElementById('poText').textContent = getDisplayText(currentOverlayId);
+  }
+  // ── End Fix with AI ──
 
   function revertOverlayPrompt() {
     if (!currentOverlayId) return;

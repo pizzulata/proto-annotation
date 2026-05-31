@@ -4,12 +4,13 @@
  * proto-annotation CLI
  *
  * Usage:
- *   npx proto-annotation                        → demo mode (built-in test page)
- *   npx proto-annotation http://localhost:3000   → proxy that URL in the review UI
- *   npx proto-annotation --port 4747            → custom server port
- *   npx proto-annotation --no-open              → don't auto-open browser
- *   npx proto-annotation --demo                 → explicitly use built-in demo page
- *   npx proto-annotation --collab               → enable collaborative review session
+ *   npx proto-annotation                                  → demo mode (built-in test page)
+ *   npx proto-annotation http://localhost:3000             → proxy that URL in the review UI
+ *   npx proto-annotation --port 4747                      → custom server port
+ *   npx proto-annotation --no-open                        → don't auto-open browser
+ *   npx proto-annotation --demo                           → explicitly use built-in demo page
+ *   npx proto-annotation --collab                         → enable collaborative review session (LAN only)
+ *   npx proto-annotation --collab --tunnel                → collab with public URL (works outside your network)
  */
 
 import { createServer } from '../src/server/index.mjs';
@@ -40,7 +41,9 @@ let port = 4747;
 let shouldOpen = true;
 let demo = false;
 let collab = false;
+let tunnel = false;
 let anthropicKey = null;
+let srcDir = null;
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--port' && args[i + 1]) {
@@ -52,8 +55,14 @@ for (let i = 0; i < args.length; i++) {
     demo = true;
   } else if (args[i] === '--collab') {
     collab = true;
+  } else if (args[i] === '--tunnel') {
+    tunnel = true;
+    collab = true; // tunnel implies collab
   } else if (args[i] === '--anthropic-key' && args[i + 1]) {
     anthropicKey = args[i + 1];
+    i++;
+  } else if (args[i] === '--src' && args[i + 1]) {
+    srcDir = resolve(args[i + 1]);
     i++;
   } else if (args[i].startsWith('http')) {
     targetUrl = args[i];
@@ -67,6 +76,9 @@ if (anthropicKey) process.env.ANTHROPIC_API_KEY = anthropicKey;
 
 // Annotations data file — persists across restarts in the current working directory
 const dataPath = resolve(process.cwd(), '.proto-annotation-data.json');
+
+// Source directory for Fix with AI (default: CWD, not used in demo mode)
+if (!srcDir && !demo) srcDir = process.cwd();
 
 // If no URL provided, use demo mode
 if (!targetUrl) demo = true;
@@ -92,6 +104,7 @@ const link  = (s) => c(110, s);  // slate blue    — URLs
 const code  = (s) => c(179, s);  // warm amber    — invite code
 const share = (s) => c(108, s);  // sage green    — share URL
 const bx    = (s) => c(103, s);  // muted blue-gray — logo box
+const warn  = (s) => c(214, s);  // orange — warnings
 
 // Read version from package.json
 let version = '';
@@ -100,9 +113,41 @@ try {
   version = pkg.version;
 } catch {}
 
-const { server, inviteCode, hostToken } = createServer({ port, targetUrl, demo, collab, dataPath });
+const { server, inviteCode, hostToken } = createServer({ port, targetUrl, demo, collab, dataPath, srcDir });
 
-server.listen(port, () => {
+async function start() {
+  // Start the server
+  await new Promise((resolve) => server.listen(port, resolve));
+
+  // Start tunnel if requested
+  let shareUrl = null;
+  let tunnelInstance = null;
+
+  if (collab && tunnel) {
+    process.stdout.write(`  ${muted('Tunnel')}   ${faint('starting...')}\r`);
+    try {
+      const lt = await import('localtunnel');
+      tunnelInstance = await lt.default({ port });
+      shareUrl = `${tunnelInstance.url}/join?code=${inviteCode}`;
+
+      tunnelInstance.on('error', (err) => {
+        console.error(`\n  ${warn('Tunnel error:')} ${err.message}`);
+      });
+      tunnelInstance.on('close', () => {
+        // tunnel closed silently
+      });
+    } catch (err) {
+      console.error(`  ${warn('Tunnel failed:')} ${err.message} — falling back to LAN IP`);
+      tunnel = false;
+    }
+  }
+
+  if (collab && !tunnel) {
+    const lanIP = getLanIP();
+    shareUrl = `http://${lanIP}:${port}/join?code=${inviteCode}`;
+  }
+
+  // ── Print startup banner ──
   const target = demo ? muted('built-in demo') : link(targetUrl);
 
   const logoLines = [
@@ -116,7 +161,11 @@ server.listen(port, () => {
   console.log('');
   logoLines.forEach(line => console.log(bx(line)));
   console.log('');
-  console.log(`  ${faint('v' + version)}${collab ? `  ${muted('·')}  ${muted('collab')}` : ''}`);
+
+  const badges = [faint('v' + version)];
+  if (collab) badges.push(muted('·'), muted('collab'));
+  if (tunnel) badges.push(muted('·'), muted('tunnel'));
+  console.log(`  ${badges.join('  ')}`);
   console.log('');
   console.log(`  ${faint('─────────────────────────────────────')}`);
   console.log('');
@@ -124,13 +173,16 @@ server.listen(port, () => {
   console.log(`  ${muted('Local')}    ${link(`http://localhost:${port}`)}`);
 
   if (collab) {
-    const lanIP = getLanIP();
-    const shareUrl = `http://${lanIP}:${port}/join?code=${inviteCode}`;
     console.log('');
     console.log(`  ${muted('Code')}     ${code(inviteCode)}`);
     console.log(`  ${muted('Share')}    ${share(shareUrl)}`);
     console.log('');
-    console.log(`  ${faint('Share the link above with your team.')}`);
+    if (tunnel) {
+      console.log(`  ${faint('Works anywhere — not just your WiFi.')}`);
+    } else {
+      console.log(`  ${faint('Share the link above with your team.')}`);
+      console.log(`  ${faint('Add --tunnel to share outside your network.')}`);
+    }
   }
 
   console.log('');
@@ -143,4 +195,19 @@ server.listen(port, () => {
       : `http://localhost:${port}`;
     open(hostUrl);
   }
+
+  // Clean up tunnel on exit
+  process.on('SIGINT', () => {
+    if (tunnelInstance) tunnelInstance.close();
+    process.exit(0);
+  });
+  process.on('SIGTERM', () => {
+    if (tunnelInstance) tunnelInstance.close();
+    process.exit(0);
+  });
+}
+
+start().catch((err) => {
+  console.error('Failed to start:', err.message);
+  process.exit(1);
 });

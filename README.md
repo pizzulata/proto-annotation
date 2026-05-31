@@ -16,6 +16,8 @@
 
 Design review tool for coded prototypes. Annotate UI elements, generate AI-ready prompts, paste into Cursor or Claude Code.
 
+![proto-annotation demo](https://raw.githubusercontent.com/pizzulata/proto-annotation/main/proto_annotation_video_demo.gif)
+
 ## Quick Start
 
 ```bash
@@ -70,37 +72,20 @@ Enhance is built in — no setup, no API key needed.
 Review prototypes together. One person hosts, teammates join with a link.
 
 ```bash
+# LAN only (same WiFi)
 npx proto-annotation http://localhost:3000 --collab
+
+# Anywhere in the world (uses a public tunnel)
+npx proto-annotation http://localhost:3000 --collab --tunnel
 ```
 
 The terminal prints a share URL:
 
 ```
-    ____             __
-   / __ \_________  / /_____
-  / /_/ / ___/ __ \/ __/ __ \
- / ____/ /  / /_/ / /_/ /_/ /
-/_/   /_/   \____/\__/\____/
-
-   ___                      __        __  _
-  /   |  ____  ____  ____  / /_____ _/ /_(_)___  ____
- / /| | / __ \/ __ \/ __ \/ __/ __ `/ __/ / __ \/ __ \
-/ ___ |/ / / / / / / /_/ / /_/ /_/ / /_/ / /_/ / / / /
-/_/  |_/_/ /_/_/ /_/\____/\__/\__,_/\__/_/\____/_/ /_/
-
-  v0.4.0  ·  collab
-
-  ─────────────────────────────────────
-
-  Target   http://localhost:3000
-  Local    http://localhost:4747
-
   Code     a3f7c2
-  Share    http://192.168.1.5:4747/join?code=a3f7c2
+  Share    https://neat-items-follow.loca.lt/join?code=a3f7c2
 
-  Share the link above with your team.
-
-  Ctrl+C to stop
+  Works anywhere — not just your WiFi.
 ```
 
 Send the **Share** link to your team. They click it, type their name, and they're in — no install, no account needed.
@@ -111,6 +96,14 @@ Send the **Share** link to your team. They click it, type their name, and they'r
 - **Author tracking** — each annotation shows who created it
 - **Ownership** — only the author (or host) can delete an annotation
 - **Invite-only** — no one can join without the session code
+
+## Share to Slack
+
+Post your pending annotations to a Slack channel in one click.
+
+Click the **Slack icon** in the toolbar → paste your Incoming Webhook URL once (saved locally) → **Send**. Your annotations appear as a formatted message with type, element, labels, and author.
+
+To create a webhook: Slack → Apps → Incoming Webhooks → Add New Webhook → copy the URL.
 
 ## Annotation Types + Labels
 
@@ -180,7 +173,8 @@ npx proto-annotation                    # Demo mode (built-in test page)
   --port <port>                         # Server port (default: 4747)
   --no-open                             # Don't auto-open browser
   --demo                                # Explicitly use demo mode
-  --collab                              # Enable collaborative review session
+  --collab                              # Enable collaborative review session (LAN)
+  --tunnel                              # Public tunnel for collab (works anywhere)
 ```
 
 ## Works With
@@ -203,8 +197,9 @@ The file is plain JSON — you can back it up, share it, or check it into versio
 
 ## Roadmap
 
+- [ ] Canva doc export — generate a shareable design review doc from your annotations
+- [ ] Slack OAuth — connect Slack once, pick a channel, share with one click
 - [ ] MCP server for direct Cursor/Claude Code integration (no copy-paste)
-- [ ] Figma link attachments ("should look like this frame")
 - [ ] Screenshot capture (before/after per annotation)
 - [ ] @mentions — tag teammates on specific annotations
 

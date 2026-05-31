@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard — Demo App</title>
+<link rel="stylesheet" href="/demo/styles.css">
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="sidebar-logo">acme.</div>
+  <div class="sidebar-section">Navigation</div>
+  <div class="nav-item active">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="1" y="1" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="9" y="1" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="1" y="9" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="9" y="9" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.2"/></svg>
+    Overview
+  </div>
+  <div class="nav-item">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><path d="M2 4a1 1 0 011-1h4l2 2h5a1 1 0 011 1v6a1 1 0 01-1 1H3a1 1 0 01-1-1V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+    Projects
+  </div>
+  <div class="nav-item">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><circle cx="6" cy="5" r="2.5" stroke="currentColor" stroke-width="1.2"/><path d="M1 13c0-2.5 2.2-4 5-4s5 1.5 5 4" stroke="currentColor" stroke-width="1.2"/></svg>
+    Team
+  </div>
+  <div class="nav-item">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.2"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+    Settings
+  </div>
+  <div class="sidebar-spacer"></div>
+  <div class="sidebar-user">
+    <div class="sidebar-avatar">S</div>
+    Simone
+  </div>
+</div>
+
+<div class="content">
+  <div class="page-title">Overview</div>
+  <div class="page-subtitle">Last updated 3 minutes ago</div>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">Total Users</div>
+      <div class="stat-value">2,847</div>
+      <div class="stat-delta up">+12% this week</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Revenue</div>
+      <div class="stat-value">$14.3k</div>
+      <div class="stat-delta up">+8% this week</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Churn Rate</div>
+      <div class="stat-value">2.1%</div>
+      <div class="stat-delta flat">unchanged</div>
+    </div>
+  </div>
+
+  <div class="section-label">Quick Add</div>
+  <div class="quick-add">
+    <input class="input-field" placeholder="name@company.com" />
+    <button class="btn-primary">Invite</button>
+  </div>
+
+  <div class="section-label">Recent Activity</div>
+  <div class="data-table">
+    <div class="table-header">
+      <span>Member</span><span>Plan</span><span>Status</span><span>MRR</span>
+    </div>
+    <div class="table-row">
+      <span>Mia Chen</span>
+      <span class="muted">Pro</span>
+      <span><span class="badge active">Active</span></span>
+      <span>$49</span>
+    </div>
+    <div class="table-row">
+      <span>James Park</span>
+      <span class="muted">Team</span>
+      <span><span class="badge pending">Pending</span></span>
+      <span>$129</span>
+    </div>
+    <div class="table-row">
+      <span>Sara Ali</span>
+      <span class="muted">Starter</span>
+      <span><span class="badge inactive">Inactive</span></span>
+      <span>$0</span>
+    </div>
+    <div class="table-row">
+      <span>Lucas Vega</span>
+      <span class="muted">Pro</span>
+      <span><span class="badge active">Active</span></span>
+      <span>$49</span>
+    </div>
+  </div>
+
+  <div class="action-row">
+    <button class="btn-primary">Export CSV</button>
+    <button class="btn-secondary">View all &rarr;</button>
+  </div>
+</div>
+
+</body>
+</html>

@@ -1,6 +1,6 @@
 {
   "name": "proto-annotation",
-  "version": "0.5.0",
+  "version": "0.6.4",
   "description": "Design review tool for prototypes. Annotate UI elements, generate agent prompts, paste into Cursor/Claude Code.",
   "bin": {
     "proto-annotation": "bin/cli.mjs"
@@ -8,7 +8,8 @@
   "type": "module",
   "files": [
     "bin",
-    "src"
+    "src",
+    "demo"
   ],
   "scripts": {
     "dev": "node bin/cli.mjs",
@@ -19,6 +20,7 @@
   },
   "dependencies": {
     "express": "^4.21.0",
+    "localtunnel": "^2.0.2",
     "open": "^10.1.0",
     "ws": "^8.18.0"
   },
@@ -32,11 +34,11 @@
     "figma",
     "ui-review"
   ],
-  "homepage": "https://github.com/your-username/proto-annotation",
+  "homepage": "https://github.com/pizzulata/proto-annotation",
   "author": "Simone",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-username/proto-annotation"
+    "url": "https://github.com/pizzulata/proto-annotation"
   }
 }
