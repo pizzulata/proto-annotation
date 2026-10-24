@@ -514,6 +514,90 @@ Make the SMALLEST possible change to implement their feedback. Rules:
     res.json({ ok: true });
   });
 
+  // ── API: Run prompt (fix + auto-apply in one shot) ──
+  app.post('/api/run/:id', async (req, res) => {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return res.status(400).json({ error: 'no_key', message: 'Add ANTHROPIC_API_KEY to your .env' });
+
+    const annotations = store.getAnnotations({});
+    const annotation = annotations.find(a => a.id === req.params.id);
+    if (!annotation) return res.status(404).json({ error: 'Not found' });
+
+    // Free-form prompt (no element): use broad codebase search
+    const isFreeForm = annotation.type === 'prompt' || annotation.type === 'note';
+    if (annotation.type === 'note') return res.status(400).json({ error: 'notes_not_runnable', message: 'Notes are not runnable' });
+
+    let candidates = [];
+    if (!isFreeForm && srcDir) {
+      try { candidates = await findRelevantFiles(srcDir, annotation); } catch (e) {}
+    }
+    if (isFreeForm && srcDir) {
+      // For free-form prompts, grab top-level source files
+      try { candidates = await findRelevantFiles(srcDir, { selector: '', comment: annotation.comment, labels: [] }); } catch (e) {}
+    }
+
+    const fileContext = candidates.length
+      ? candidates.map(f => `=== ${relative(srcDir, f.path)} ===\n${f.content}`).join('\n\n')
+      : '(no source files found)';
+
+    const userMsg = isFreeForm
+      ? `Task: "${annotation.comment}"\n\nSource files:\n${fileContext}\n\nMake the minimal change to implement this. Use write_file to output the complete modified file.`
+      : `Designer feedback: "${annotation.comment}"\nElement: <${annotation.element || 'unknown'}> ${annotation.selector || ''}\nType: ${annotation.type}  Labels: ${(annotation.labels || []).join(', ')}\nCurrent CSS: ${JSON.stringify(annotation.computedStyles || {})}\nDimensions: ${annotation.boundingBox ? `${Math.round(annotation.boundingBox.width)}x${Math.round(annotation.boundingBox.height)}px` : 'unknown'}\n\nSource files:\n${fileContext}\n\nMake the minimal targeted change. Use write_file to output the complete modified file.`;
+
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-5',
+          max_tokens: 8192,
+          system: `You are a surgical UI code editor. Make the SMALLEST possible change to implement the request. Preserve all formatting and code style. Use write_file with the COMPLETE file content after your change.`,
+          tools: [{
+            name: 'write_file',
+            description: 'Write the complete modified file with your fix applied',
+            input_schema: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'Relative file path from project root' },
+                content: { type: 'string', description: 'Complete file content after applying the fix' }
+              },
+              required: ['path', 'content']
+            }
+          }],
+          messages: [{ role: 'user', content: userMsg }]
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        return res.status(502).json({ error: err.error?.message || 'Claude API error' });
+      }
+
+      const data = await response.json();
+      const toolUse = data.content?.find(b => b.type === 'tool_use' && b.name === 'write_file');
+
+      if (!toolUse) {
+        const text = data.content?.find(b => b.type === 'text')?.text || 'Claude could not identify the change needed.';
+        return res.status(422).json({ error: 'no_change', message: text });
+      }
+
+      const { path: relPath, content: proposed } = toolUse.input;
+      const absPath = join(srcDir, relPath);
+      if (!existsSync(absPath)) return res.status(404).json({ error: 'file_not_found', message: `File not found: ${relPath}` });
+
+      const original = readFileSync(absPath, 'utf8');
+      if (original === proposed) return res.json({ ok: true, noChange: true, file: relPath });
+
+      writeFileSync(absPath, proposed);
+      const updated = store.updateAnnotation(req.params.id, { status: 'fixed', fixedFile: relPath });
+      if (updated) broadcast({ type: 'annotation.updated', payload: updated });
+
+      res.json({ ok: true, file: relPath });
+    } catch (err) {
+      res.status(502).json({ error: err.message });
+    }
+  });
+
   // ── API: Share to Slack ──
   app.post('/api/slack/share', async (req, res) => {
     const { webhookUrl } = req.body;
@@ -1113,6 +1197,61 @@ function buildReviewUI(targetUrl, port, demo, collab, srcDir) {
   .history-item .time { font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
   .history-item .action { color: var(--text-secondary); margin-top: 2px; }
 
+  /* ── Prompts tab ── */
+  .pq-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px 6px; gap: 8px; }
+  .pq-run-all { display: flex; align-items: center; gap: 5px; padding: 6px 12px; background: var(--accent); color: white; border: none; border-radius: 7px; font-size: 11px; font-weight: 600; font-family: var(--font-mono); cursor: pointer; transition: opacity 0.15s; }
+  .pq-run-all:hover { opacity: 0.85; }
+  .pq-run-all:disabled { opacity: 0.4; cursor: not-allowed; }
+  .pq-run-all.running { background: var(--red, #dc2626); }
+  .pq-add { padding: 6px 10px; background: var(--surface2); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 7px; font-size: 11px; cursor: pointer; transition: all 0.15s; }
+  .pq-add:hover { border-color: var(--border-hover); color: var(--text); }
+
+  .pq-new-form { margin: 0 10px 8px; padding: 10px 12px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; }
+  .pq-new-type { display: flex; gap: 6px; margin-bottom: 8px; }
+  .pq-type-btn { padding: 3px 10px; font-size: 10px; font-weight: 600; border-radius: 10px; border: 1px solid var(--border); background: none; color: var(--muted); cursor: pointer; transition: all 0.15s; text-transform: uppercase; letter-spacing: 0.5px; }
+  .pq-type-btn.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+  .pq-new-input { width: 100%; padding: 7px 10px; background: var(--surface3); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; font-family: var(--font); color: var(--text); resize: vertical; min-height: 60px; outline: none; box-sizing: border-box; }
+  .pq-new-input:focus { border-color: var(--accent); }
+  .pq-new-actions { display: flex; gap: 6px; margin-top: 8px; justify-content: flex-end; }
+  .pq-new-save { padding: 5px 12px; background: var(--accent); color: white; border: none; border-radius: 6px; font-size: 11px; font-weight: 600; cursor: pointer; }
+  .pq-new-cancel { padding: 5px 10px; background: none; border: 1px solid var(--border); border-radius: 6px; font-size: 11px; color: var(--muted); cursor: pointer; }
+
+  .pq-list { padding: 6px 10px; }
+  .pq-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 6px; transition: border-color 0.15s; }
+  .pq-card.running { border-color: var(--accent); }
+  .pq-card.done { border-color: #2d5a3a; }
+  .pq-card.failed { border-color: #5a2d2d; }
+  .pq-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .pq-pin { width: 18px; height: 18px; border-radius: 50%; background: var(--surface3); border: 1px solid var(--border); color: var(--muted); font-size: 9px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-family: var(--font-mono); }
+  .pq-selector { font-size: 11px; color: var(--text-secondary); font-family: var(--font-mono); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pq-badge { font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 8px; text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0; }
+  .pq-badge.feedback { background: var(--accent-soft); color: var(--accent); }
+  .pq-badge.bug { background: rgba(220,38,38,0.12); color: #f87171; }
+  .pq-badge.question { background: rgba(217,119,6,0.12); color: #fbbf24; }
+  .pq-badge.prompt { background: rgba(5,150,105,0.12); color: #34d399; }
+  .pq-badge.note { background: var(--surface3); color: var(--muted); }
+  .pq-comment { font-size: 12px; color: var(--text); line-height: 1.5; margin-bottom: 8px; }
+  .pq-card-foot { display: flex; align-items: center; gap: 6px; }
+  .pq-run-btn { padding: 4px 10px; font-size: 10px; font-weight: 600; font-family: var(--font-mono); border-radius: 5px; border: 1px solid var(--accent); background: var(--accent-soft); color: var(--accent); cursor: pointer; transition: all 0.15s; text-transform: uppercase; letter-spacing: 0.5px; }
+  .pq-run-btn:hover { background: var(--accent); color: white; }
+  .pq-run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .pq-status { font-size: 10px; font-family: var(--font-mono); color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pq-status.running { color: var(--accent); }
+  .pq-status.done { color: #34d399; }
+  .pq-status.failed { color: #f87171; }
+  .pq-del { padding: 2px 6px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 12px; border-radius: 4px; transition: all 0.15s; }
+  .pq-del:hover { background: var(--surface3); color: var(--text-secondary); }
+
+  .pq-log-section { border-top: 1px solid var(--border); padding: 10px 14px; }
+  .pq-log-title { font-size: 10px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; }
+  .pq-log-clear { font-size: 9px; background: none; border: none; color: var(--muted); cursor: pointer; padding: 0; }
+  .pq-log-clear:hover { color: var(--text-secondary); }
+  .pq-log-empty { font-size: 11px; color: var(--muted); font-style: italic; }
+  .pq-log-item { font-size: 11px; font-family: var(--font-mono); padding: 5px 8px; border-radius: 5px; margin-bottom: 4px; line-height: 1.4; }
+  .pq-log-item.ok { background: rgba(5,150,105,0.08); color: #34d399; }
+  .pq-log-item.err { background: rgba(220,38,38,0.08); color: #f87171; }
+  .pq-log-item .log-time { color: var(--muted); margin-right: 6px; }
+
   /* ── Stats bar at panel bottom ── */
   .stats-bar { display: flex; gap: 4px; padding: 12px 16px; border-top: 1px solid var(--border); background: var(--surface); }
   .stat-pill { flex: 1; text-align: center; padding: 8px 4px; border-radius: 8px; background: var(--surface2); }
@@ -1257,6 +1396,7 @@ function buildReviewUI(targetUrl, port, demo, collab, srcDir) {
 
   <div class="panel-tabs">
     <div class="panel-tab active" data-tab="annotations" onclick="switchTab('annotations')">Annotations</div>
+    <div class="panel-tab" data-tab="prompts" onclick="switchTab('prompts')">Prompts</div>
     <div class="panel-tab" data-tab="history" onclick="switchTab('history')">History</div>
   </div>
 
@@ -1270,6 +1410,7 @@ function buildReviewUI(targetUrl, port, demo, collab, srcDir) {
       <div class="panel-empty-hint">Press <span class="kbd">A</span> to toggle · <span class="kbd">P</span> panel</div>
     </div>
     <div class="annotation-list" id="annotationList" style="display:none"></div>
+    <div id="promptsContent" style="display:none"></div>
     <div id="historyContent" style="display:none"></div>
   </div>
 
@@ -1411,12 +1552,14 @@ function buildReviewUI(targetUrl, port, demo, collab, srcDir) {
       if (msg.type === 'sync') {
         annotations = msg.payload.annotations;
         renderAnnotations();
+        if (activeTab === 'prompts') renderPromptQueue();
         updateStats(msg.payload.stats);
       } else if (msg.type === 'annotation.created') {
         if (!annotations.find(a => a.id === msg.payload.id)) {
           annotations.push(msg.payload);
         }
         renderAnnotations();
+        if (activeTab === 'prompts') renderPromptQueue();
         logHistory('added', msg.payload);
         // Auto-open panel on first annotation
         if (annotations.length === 1 && !panelOpen) togglePanel();
@@ -1424,13 +1567,16 @@ function buildReviewUI(targetUrl, port, demo, collab, srcDir) {
         const idx = annotations.findIndex(a => a.id === msg.payload.id);
         if (idx >= 0) annotations[idx] = msg.payload;
         renderAnnotations();
+        if (activeTab === 'prompts') renderPromptQueue();
         logHistory('updated', msg.payload);
       } else if (msg.type === 'annotation.deleted') {
         annotations = annotations.filter(a => a.id !== msg.payload.id);
         renderAnnotations();
+        if (activeTab === 'prompts') renderPromptQueue();
       } else if (msg.type === 'annotations.cleared') {
         annotations = [];
         renderAnnotations();
+        if (activeTab === 'prompts') renderPromptQueue();
       } else if (msg.type === 'participant.joined') {
         if (!participants.find(p => p.id === msg.payload.id)) {
           participants.push(msg.payload);
@@ -1508,7 +1654,9 @@ function buildReviewUI(targetUrl, port, demo, collab, srcDir) {
     document.querySelectorAll('.panel-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
     document.getElementById('annotationList').style.display = tab === 'annotations' && annotations.length ? 'block' : 'none';
     document.getElementById('emptyState').style.display = tab === 'annotations' && !annotations.length ? 'flex' : 'none';
+    document.getElementById('promptsContent').style.display = tab === 'prompts' ? 'block' : 'none';
     document.getElementById('historyContent').style.display = tab === 'history' ? 'block' : 'none';
+    if (tab === 'prompts') renderPromptQueue();
   }
 
   function renderAnnotations() {
@@ -1584,6 +1732,167 @@ function buildReviewUI(targetUrl, port, demo, collab, srcDir) {
         <div class="action">\${h.action}: \${esc((h.annotation.comment || '').slice(0, 60))}</div>
       </div>
     \`).join('');
+  }
+
+  // ═══ PROMPT QUEUE ═══
+  let pqRunning = false;
+  let pqStop = false;
+  let pqLog = [];
+  let pqStatuses = {}; // id → { state: idle|running|done|failed, msg }
+  let pqFreeForm = []; // { id, type: 'prompt'|'note', comment }
+  let pqShowNewForm = false;
+  let pqNewType = 'prompt';
+
+  function pqId() { return 'pq-' + Math.random().toString(36).slice(2, 9); }
+
+  function renderPromptQueue() {
+    const el = document.getElementById('promptsContent');
+    if (!el) return;
+
+    const allCards = [
+      ...annotations.map(a => ({ ...a, _src: 'annotation' })),
+      ...pqFreeForm.map(a => ({ ...a, _src: 'freeform' }))
+    ];
+    const runnable = allCards.filter(a => a.type !== 'note');
+
+    el.innerHTML = \`
+      <div class="pq-header">
+        <button class="pq-run-all \${pqRunning ? 'running' : ''}" id="pqRunAllBtn" onclick="pqToggleRunAll()" \${!runnable.length ? 'disabled' : ''}>
+          \${pqRunning ? '⏹ Stop' : '▶ Run All'} \${!pqRunning && runnable.length ? '(' + runnable.length + ')' : ''}
+        </button>
+        <button class="pq-add" onclick="pqToggleNewForm()">+ Add</button>
+      </div>
+      \${pqShowNewForm ? \`
+      <div class="pq-new-form">
+        <div class="pq-new-type">
+          <button class="pq-type-btn \${pqNewType === 'prompt' ? 'active' : ''}" onclick="pqSetNewType('prompt')">Prompt</button>
+          <button class="pq-type-btn \${pqNewType === 'note' ? 'active' : ''}" onclick="pqSetNewType('note')">Note</button>
+        </div>
+        <textarea class="pq-new-input" id="pqNewInput" placeholder="\${pqNewType === 'prompt' ? 'Describe what to change…' : 'Add a note for context…'}"></textarea>
+        <div class="pq-new-actions">
+          <button class="pq-new-cancel" onclick="pqCancelNew()">Cancel</button>
+          <button class="pq-new-save" onclick="pqSaveNew()">Add</button>
+        </div>
+      </div>
+      \` : ''}
+      <div class="pq-list">
+        \${allCards.length === 0 ? '<div style="padding:16px;font-size:12px;color:var(--muted);text-align:center;">No annotations yet.<br>Add some or switch to Annotations tab.</div>' : ''}
+        \${allCards.map((a, i) => {
+          const st = pqStatuses[a.id] || { state: 'idle', msg: '' };
+          const isNote = a.type === 'note';
+          return \`
+          <div class="pq-card \${st.state !== 'idle' ? st.state : ''}" id="pq-card-\${a.id}">
+            <div class="pq-card-head">
+              <div class="pq-pin">\${i + 1}</div>
+              <div class="pq-selector">\${esc(a.elementPath || a.selector || (a._src === 'freeform' ? 'free-form' : ''))}</div>
+              <span class="pq-badge \${a.type || 'feedback'}">\${a.type || 'feedback'}</span>
+            </div>
+            <div class="pq-comment">\${esc((a.comment || '').slice(0, 120))}</div>
+            <div class="pq-card-foot">
+              \${!isNote ? \`<button class="pq-run-btn" id="pq-run-\${a.id}" onclick="pqRunOne('\${a.id}')" \${pqRunning || st.state === 'running' ? 'disabled' : ''}>Run</button>\` : ''}
+              <span class="pq-status \${st.state}" id="pq-status-\${a.id}">\${st.msg || (isNote ? 'note — not runnable' : st.state === 'idle' ? '' : st.state)}</span>
+              \${a._src === 'freeform' ? \`<button class="pq-del" onclick="pqDeleteFreeForm('\${a.id}')">&times;</button>\` : ''}
+            </div>
+          </div>
+          \`;
+        }).join('')}
+      </div>
+      <div class="pq-log-section">
+        <div class="pq-log-title">
+          Log
+          <button class="pq-log-clear" onclick="pqClearLog()">Clear</button>
+        </div>
+        \${pqLog.length === 0 ? '<div class="pq-log-empty">No runs yet.</div>' : pqLog.slice(0, 20).map(l => \`
+          <div class="pq-log-item \${l.ok ? 'ok' : 'err'}">
+            <span class="log-time">\${l.time}</span>\${esc(l.msg)}
+          </div>
+        \`).join('')}
+      </div>
+    \`;
+  }
+
+  function pqAddLog(ok, msg) {
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    pqLog.unshift({ ok, msg, time });
+    if (pqLog.length > 50) pqLog.pop();
+  }
+  function pqClearLog() { pqLog = []; renderPromptQueue(); }
+
+  function pqSetStatus(id, state, msg) {
+    pqStatuses[id] = { state, msg };
+    const card = document.getElementById('pq-card-' + id);
+    if (card) { card.className = 'pq-card' + (state !== 'idle' ? ' ' + state : ''); }
+    const st = document.getElementById('pq-status-' + id);
+    if (st) { st.className = 'pq-status ' + state; st.textContent = msg || state; }
+    const btn = document.getElementById('pq-run-' + id);
+    if (btn) btn.disabled = pqRunning || state === 'running';
+  }
+
+  async function pqRunOne(id) {
+    if (pqStatuses[id]?.state === 'running') return;
+    pqSetStatus(id, 'running', 'running…');
+    try {
+      const res = await fetch('/api/run/' + id, { method: 'POST', headers: authHeaders() });
+      const data = await res.json();
+      if (!res.ok) {
+        const msg = data.message || data.error || 'failed';
+        pqSetStatus(id, 'failed', msg);
+        pqAddLog(false, msg);
+      } else if (data.noChange) {
+        pqSetStatus(id, 'done', 'no change needed');
+        pqAddLog(true, 'no change needed');
+      } else {
+        pqSetStatus(id, 'done', 'fixed: ' + (data.file || ''));
+        pqAddLog(true, 'fixed ' + (data.file || ''));
+      }
+    } catch (e) {
+      pqSetStatus(id, 'failed', e.message);
+      pqAddLog(false, e.message);
+    }
+    if (activeTab === 'prompts') renderPromptQueue();
+  }
+
+  async function pqToggleRunAll() {
+    if (pqRunning) { pqStop = true; return; }
+    const allCards = [
+      ...annotations.map(a => ({ ...a })),
+      ...pqFreeForm.map(a => ({ ...a }))
+    ].filter(a => a.type !== 'note');
+    if (!allCards.length) return;
+
+    pqRunning = true;
+    pqStop = false;
+    renderPromptQueue();
+
+    for (const a of allCards) {
+      if (pqStop) break;
+      await pqRunOne(a.id);
+      if (activeTab === 'prompts') {
+        const btn = document.getElementById('pqRunAllBtn');
+        if (btn) btn.textContent = pqStop ? '⏹ Stopping…' : '⏹ Stop';
+      }
+    }
+
+    pqRunning = false;
+    pqStop = false;
+    renderPromptQueue();
+  }
+
+  function pqToggleNewForm() { pqShowNewForm = !pqShowNewForm; renderPromptQueue(); if (pqShowNewForm) setTimeout(() => document.getElementById('pqNewInput')?.focus(), 50); }
+  function pqSetNewType(t) { pqNewType = t; renderPromptQueue(); setTimeout(() => document.getElementById('pqNewInput')?.focus(), 50); }
+  function pqCancelNew() { pqShowNewForm = false; renderPromptQueue(); }
+  function pqSaveNew() {
+    const input = document.getElementById('pqNewInput');
+    const text = input?.value?.trim();
+    if (!text) return;
+    pqFreeForm.push({ id: pqId(), type: pqNewType, comment: text, _src: 'freeform' });
+    pqShowNewForm = false;
+    renderPromptQueue();
+  }
+  function pqDeleteFreeForm(id) {
+    pqFreeForm = pqFreeForm.filter(a => a.id !== id);
+    delete pqStatuses[id];
+    renderPromptQueue();
   }
 
   // ═══ STATS ═══
